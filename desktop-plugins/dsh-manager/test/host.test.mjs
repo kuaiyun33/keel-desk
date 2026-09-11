@@ -6,7 +6,7 @@ import { join } from 'node:path'
 
 import { apply, matchProfileId, name, settingsFile, normalizeArmorMode } from '../src/index.mjs'
 import { REVERIFY_TOOLS, probeReverify, runReverifyTool, resolveHostPython } from '../src/reverify.mjs'
-import { runPentagiTool, buildSandboxDockerArgs, flowFilesRestPath, KNOWLEDGE_SEARCH_GQL, SANDBOX_CAP_ADD, formatSpecialistDispatchInput, SPECIALIST_ROLES, generateFlowMarkdown, scraperPublicUrl, buildMultipart, jsonSafe } from '../src/pentagi.mjs'
+import { runPentagiTool, buildSandboxDockerArgs, wrapSandboxHostLoopback, flowFilesRestPath, KNOWLEDGE_SEARCH_GQL, SANDBOX_CAP_ADD, formatSpecialistDispatchInput, SPECIALIST_ROLES, generateFlowMarkdown, scraperPublicUrl, buildMultipart, jsonSafe, extractAssistantResult, extractSpecialistResult, resolveKnowledgeIds } from '../src/pentagi.mjs'
 import { applyLlmToEnvText } from '../src/pentagi-providers.mjs'
 import { pentestImage, whichDocker, pentagiSandboxEnabled, pentagiDindEnabled } from '../src/pentagi-runtime.mjs'
 
@@ -615,8 +615,18 @@ test('Kali sandbox docker args drop ALL then add official pentest caps including
     assert.ok(args.includes(cap), `cap ${cap} not in docker args`)
   }
   assert.ok(args.includes('/var/run/docker.sock:/var/run/docker.sock') || args.some(v => v.includes('docker.sock')))
+  assert.ok(args.includes('--add-host'))
+  assert.ok(args.includes('host.docker.internal:host-gateway'))
   assert.equal(args.at(-4), 'vxcontrol/kali-linux')
-  assert.equal(args.at(-1), 'nmap -V')
+  assert.match(args.at(-1), /socat TCP-LISTEN:9050,bind=127\.0\.0\.1/)
+  assert.match(args.at(-1), /socat TCP-LISTEN:9150,bind=127\.0\.0\.1/)
+  assert.match(args.at(-1), /nmap -V/)
+})
+
+test('sandbox wraps host Tor loopback so 127.0.0.1:9050 reaches the Mac daemon', () => {
+  const wrapped = wrapSandboxHostLoopback('curl --socks5-hostname 127.0.0.1:9050 https://example.com')
+  assert.match(wrapped, /host\.docker\.internal:9050/)
+  assert.match(wrapped, /curl --socks5-hostname 127\.0\.0\.1:9050/)
 })
 
 test('knowledge search GraphQL matches official schema (no withContent)', () => {
@@ -713,6 +723,44 @@ test('flow markdown report matches official heading layout', () => {
 test('scraper public URL defaults to local 9443', () => {
   assert.equal(scraperPublicUrl({ DSH_PENTAGI_SCRAPER_URL: '' }), 'https://someuser:somepass@127.0.0.1:9443')
   assert.equal(scraperPublicUrl({ DSH_PENTAGI_SCRAPER_URL: 'https://user:pass@127.0.0.1:9443/' }), 'https://user:pass@127.0.0.1:9443')
+})
+
+test('extractAssistantResult ignores narration and waits for the specialist answer', () => {
+  const logs = [
+    { type: 'input', message: 'delegate to advice' },
+    { type: 'answer', message: "I'll send this supervision smoke test to the senior mentor now." },
+    { type: 'advice', message: 'Delegating the supervision smoke test to the senior mentor.' },
+    { type: 'answer', message: 'Closing with runtime facts the adviser does not already have: Kali image.' },
+  ]
+  assert.equal(extractAssistantResult(logs), '')
+  logs.push({ type: 'answer', message: '(1) senior mentor (2) yes I review tool output (3) nmap -sn 127.0.0.1' })
+  assert.match(extractAssistantResult(logs), /senior mentor/)
+})
+
+test('extractSpecialistResult prefers the adviser agentLog over enricher facts', () => {
+  const logs = [{ type: 'answer', message: 'Closing with runtime facts the adviser does not already have.' }]
+  const agents = [
+    { initiator: 'assistant', executor: 'enricher', result: 'Kali 2025.4 nmap 7.98' },
+    { initiator: 'assistant', executor: 'adviser', result: '(1) senior mentor (2) yes (3) nmap -sn 127.0.0.1' },
+  ]
+  assert.equal(extractSpecialistResult('coder', logs, agents), '')
+  assert.match(extractSpecialistResult('adviser', logs, agents), /senior mentor/)
+})
+
+test('resolveKnowledgeIds maps local k-* ids onto the official UUID', () => {
+  const store = {
+    documents: [{
+      id: '2f0514b2-2f6c-4779-9b00-3a6e69718b81',
+      localId: 'k-1789157327217',
+      remoteId: '2f0514b2-2f6c-4779-9b00-3a6e69718b81',
+    }],
+  }
+  const byLocal = resolveKnowledgeIds(store, 'k-1789157327217')
+  assert.equal(byLocal.remoteId, '2f0514b2-2f6c-4779-9b00-3a6e69718b81')
+  const byRemote = resolveKnowledgeIds(store, '2f0514b2-2f6c-4779-9b00-3a6e69718b81')
+  assert.equal(byRemote.localId, 'k-1789157327217')
+  const orphan = resolveKnowledgeIds({ documents: [{ id: 'k-1' }] }, 'k-1')
+  assert.equal(orphan.remoteId, '')
 })
 
 test('pg_pentester falls back to a local stub when the official token is missing and API is down', async () => {

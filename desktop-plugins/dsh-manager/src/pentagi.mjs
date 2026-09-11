@@ -1345,13 +1345,24 @@ export function flowFilesRestPath(flowId, suffix = '') {
   return `${base}${String(suffix).replace(/^\/+/, '')}`
 }
 
+/** Host Tor SOCKS (and Browser SOCKS) — Kali 127.0.0.1 is the container, not the Mac. */
+export const HOST_LOOPBACK_FORWARD_PORTS = [9050, 9150]
+
+export function wrapSandboxHostLoopback(input) {
+  const forwards = HOST_LOOPBACK_FORWARD_PORTS.map((port) => (
+    `socat TCP-LISTEN:${port},bind=127.0.0.1,fork,reuseaddr TCP:host.docker.internal:${port} >/tmp/dsh-socat-${port}.log 2>&1 &`
+  )).join('\n')
+  return `${forwards}\nsleep 0.15\n${input}`
+}
+
 export function buildSandboxDockerArgs({ detach, workHost, workInContainer, dind, image, input }) {
   const dockerArgs = ['run', '--rm', '--cap-drop', 'ALL']
   for (const cap of SANDBOX_CAP_ADD) dockerArgs.push('--cap-add', cap)
   if (detach === true) dockerArgs.push('-d')
+  dockerArgs.push('--add-host', 'host.docker.internal:host-gateway')
   dockerArgs.push('-v', `${workHost}:/work`)
   if (dind) dockerArgs.push('-v', `${dockerSocketInVm()}:/var/run/docker.sock`)
-  dockerArgs.push('-w', workInContainer, image, 'sh', '-lc', input)
+  dockerArgs.push('-w', workInContainer, image, 'sh', '-lc', wrapSandboxHostLoopback(input))
   return dockerArgs
 }
 
@@ -1562,7 +1573,9 @@ export const SPECIALIST_ROLES = {
 }
 
 export const SPECIALIST_POLL_MS = 60_000
+export const SPECIALIST_ADVISER_POLL_MS = 180_000
 const SPECIALIST_POLL_INTERVAL_MS = 2_500
+const ASSISTANT_NARRATION_RE = /^(i('ll| will)|delegat|searching|checking|capturing|closing with runtime)/i
 
 export function formatSpecialistDispatchInput(kind, question, extra = {}) {
   const spec = SPECIALIST_ROLES[kind] || SPECIALIST_ROLES.pentester
@@ -1615,15 +1628,41 @@ function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
 
-function extractAssistantResult(logs = []) {
-  const ranked = ['report', 'answer', 'done', 'advice']
+export function extractAssistantResult(logs = []) {
+  const ranked = ['report', 'answer', 'done']
   const items = [...logs].reverse()
   for (const type of ranked) {
-    const hit = items.find(item => item?.type === type && (item.result || item.message))
+    const hit = items.find((item) => {
+      if (item?.type !== type) return false
+      const text = String(item.result || item.message || '').trim()
+      if (!text) return false
+      if (type === 'answer' && ASSISTANT_NARRATION_RE.test(text)) return false
+      return true
+    })
     if (hit) return String(hit.result || hit.message)
   }
-  const any = items.find(item => item?.result || item?.message)
-  return any ? String(any.result || any.message) : ''
+  return ''
+}
+
+export function extractSpecialistResult(kind, logs = [], agents = []) {
+  if (kind === 'adviser') {
+    const hit = [...agents].reverse().find(item => item?.executor === 'adviser' && String(item.result || '').trim())
+    if (hit) return String(hit.result)
+  }
+  return extractAssistantResult(logs)
+}
+
+function adviserLogPresent(agents = []) {
+  return (agents ?? []).some(item => item?.executor === 'adviser' && String(item.result || '').trim())
+}
+
+export function resolveKnowledgeIds(store, id) {
+  const requested = String(id ?? '').trim()
+  const docs = store?.documents ?? []
+  const doc = docs.find(item => item.id === requested || item.localId === requested || item.remoteId === requested) ?? null
+  const remoteId = String(doc?.remoteId || (!requested.startsWith('k-') ? requested : '') || '').trim()
+  const localId = String(doc?.localId || (requested.startsWith('k-') ? requested : '') || '').trim()
+  return { doc, localId, remoteId }
 }
 
 function rememberDispatch(env, entry) {
@@ -1679,7 +1718,7 @@ async function ensureRemoteFlow(env) {
 
 const ASSISTANT_WATCH_GQL = 'query WatchAsst($flowId: ID!, $assistantId: ID!) { assistants(flowId: $flowId) { id title status useAgents updatedAt } assistantLogs(flowId: $flowId, assistantId: $assistantId) { id type message result createdAt } agentLogs(flowId: $flowId) { id initiator executor task result createdAt } }'
 
-async function pollOfficialAssistant(flowId, assistantId, env, timeoutMs = SPECIALIST_POLL_MS) {
+async function pollOfficialAssistant(flowId, assistantId, env, timeoutMs = SPECIALIST_POLL_MS, kind = '') {
   const deadline = Date.now() + Math.max(5_000, timeoutMs)
   let snapshot = { status: 'running', logs: [], agents: [], assistants: [] }
   while (Date.now() < deadline) {
@@ -1693,31 +1732,21 @@ async function pollOfficialAssistant(flowId, assistantId, env, timeoutMs = SPECI
       status: match.status || 'running',
       useAgents: match.useAgents,
       logs,
-      agents: agents.slice(-20),
+      agents: agents.slice(-40),
       assistants,
       remote: watch,
     }
-    if (['waiting', 'finished', 'failed'].includes(snapshot.status)) break
-    if (extractAssistantResult(logs)) {
-      await delay(800)
-      const once = await graphql(ASSISTANT_WATCH_GQL, { flowId, assistantId }, env)
-      const again = once.json?.data?.assistants?.find(item => String(item.id) === String(assistantId))
-      if (again && ['waiting', 'finished', 'failed'].includes(again.status)) {
-        snapshot = {
-          ok: once.ok,
-          status: again.status,
-          useAgents: again.useAgents,
-          logs: once.json?.data?.assistantLogs ?? logs,
-          agents: (once.json?.data?.agentLogs ?? agents).slice(-20),
-          assistants: once.json?.data?.assistants ?? assistants,
-          remote: once,
-        }
-        break
+    const settled = ['waiting', 'finished', 'failed'].includes(snapshot.status)
+    if (settled) {
+      if (kind === 'adviser' && snapshot.status !== 'failed' && !adviserLogPresent(snapshot.agents) && Date.now() < deadline) {
+        await delay(SPECIALIST_POLL_INTERVAL_MS)
+        continue
       }
+      break
     }
     await delay(SPECIALIST_POLL_INTERVAL_MS)
   }
-  snapshot.result = extractAssistantResult(snapshot.logs)
+  snapshot.result = extractSpecialistResult(kind, snapshot.logs, snapshot.agents)
   snapshot.supervision = (snapshot.agents ?? []).map(item => `${item.initiator}→${item.executor}`).filter(Boolean)
   return snapshot
 }
@@ -1772,8 +1801,10 @@ async function dispatchSpecialist(kind, args, env) {
     question,
     provider,
   })
-  const timeoutMs = Number(args.timeout) > 0 ? Math.min(Number(args.timeout) * 1000, 600_000) : SPECIALIST_POLL_MS
-  const watch = await pollOfficialAssistant(flowInfo.flowId, assistantId, env, timeoutMs)
+  const timeoutMs = Number(args.timeout) > 0
+    ? Math.min(Number(args.timeout) * 1000, 600_000)
+    : (kind === 'adviser' ? SPECIALIST_ADVISER_POLL_MS : SPECIALIST_POLL_MS)
+  const watch = await pollOfficialAssistant(flowInfo.flowId, assistantId, env, timeoutMs, kind)
   const settled = ['waiting', 'finished', 'failed'].includes(watch.status)
   const payload = {
     ok: created.ok && watch.status !== 'failed',
@@ -2214,26 +2245,45 @@ async function executePentagiTool(name, args = {}, env = process.env) {
         env,
       )
       const store = knowledgeLocal(env)
-      const doc = { id: `k-${Date.now()}`, ...a, at: new Date().toISOString() }
+      const localId = `k-${Date.now()}`
+      const remoteId = remote.json?.data?.createKnowledgeDocument?.id ? String(remote.json.data.createKnowledgeDocument.id) : ''
+      const doc = {
+        ...a,
+        id: remoteId || localId,
+        localId,
+        remoteId: remoteId || null,
+        at: new Date().toISOString(),
+      }
       store.documents.push(doc)
       saveKnowledge(store, env)
       return { ok: true, local: doc, remote }
     }
     case 'pg_knowledge_get': {
       if (a.id) {
-        const remote = await graphql('query K($id: String!) { knowledgeDocument(id: $id) { id question description docType content } }', { id: a.id }, env)
-        const local = knowledgeLocal(env).documents.find(d => d.id === a.id) ?? null
-        return { ok: true, local, remote }
+        const store = knowledgeLocal(env)
+        const resolved = resolveKnowledgeIds(store, a.id)
+        const remoteLookup = resolved.remoteId || a.id
+        const remote = await graphql('query K($id: String!) { knowledgeDocument(id: $id) { id question description docType content } }', { id: remoteLookup }, env)
+        return { ok: true, local: resolved.doc, remote }
       }
       const remote = await graphql('query { knowledgeDocuments(withContent: false) { id question docType description } }', {}, env)
       return { ok: true, local: knowledgeLocal(env).documents, remote }
     }
     case 'pg_knowledge_delete': {
-      const remote = await graphql('mutation DelK($id: String!) { deleteKnowledgeDocument(id: $id) }', { id: a.id }, env)
       const store = knowledgeLocal(env)
-      store.documents = store.documents.filter(d => d.id !== a.id)
+      const resolved = resolveKnowledgeIds(store, a.id)
+      let remoteId = resolved.remoteId
+      if (!remoteId && resolved.doc?.question) {
+        const listed = await graphql('query { knowledgeDocuments(withContent: false) { id question } }', {}, env)
+        const match = (listed.json?.data?.knowledgeDocuments ?? []).find(item => item.question === resolved.doc.question)
+        if (match?.id) remoteId = String(match.id)
+      }
+      const remote = remoteId
+        ? await graphql('mutation DelK($id: String!) { deleteKnowledgeDocument(id: $id) }', { id: remoteId }, env)
+        : { ok: false, skipped: true, error: 'no remote uuid; local-only document' }
+      store.documents = store.documents.filter(d => d.id !== a.id && d.localId !== a.id && d.remoteId !== a.id && d.remoteId !== remoteId)
       saveKnowledge(store, env)
-      return { ok: true, id: a.id, remote }
+      return { ok: true, id: a.id, localId: resolved.localId || null, remoteId: remoteId || null, remote }
     }
     case 'pg_flow_files': {
       const flowId = currentFlowId(a, env)

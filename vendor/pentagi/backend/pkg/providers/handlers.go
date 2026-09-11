@@ -232,6 +232,14 @@ func (fp *flowProvider) GetAskAdviceHandler(ctx context.Context, taskID, subtask
 			return "", wrapError(ctx, "failed to get advice", err)
 		}
 
+		// performSimpleChain persists the msgchain but does not write agentLogs.
+		// Without this entry, supervisor UIs only see enricher facts and never the mentor reply.
+		initiator := database.MsgchainTypeAssistant
+		if agentCtx, ok := tools.GetAgentContext(ctx); ok {
+			initiator = agentCtx.CurrentAgentType
+		}
+		fp.putAgentLog(ctx, initiator, database.MsgchainTypeAdviser, ask.Question, advice, taskID, subtaskID)
+
 		return advice, nil
 	}
 
