@@ -6,7 +6,7 @@ import { join } from 'node:path'
 
 import { apply, matchProfileId, name, settingsFile, normalizeArmorMode } from '../src/index.mjs'
 import { REVERIFY_TOOLS, probeReverify, runReverifyTool, resolveHostPython } from '../src/reverify.mjs'
-import { runPentagiTool, buildSandboxDockerArgs, wrapSandboxHostLoopback, flowFilesRestPath, KNOWLEDGE_SEARCH_GQL, SANDBOX_CAP_ADD, formatSpecialistDispatchInput, SPECIALIST_ROLES, generateFlowMarkdown, scraperPublicUrl, buildMultipart, jsonSafe, extractAssistantResult, extractSpecialistResult, resolveKnowledgeIds } from '../src/pentagi.mjs'
+import { runPentagiTool, buildSandboxDockerArgs, buildPersistentSandboxCreateArgs, wrapSandboxHostLoopback, SANDBOX_CONTAINER_NAME, flowFilesRestPath, KNOWLEDGE_SEARCH_GQL, SANDBOX_CAP_ADD, formatSpecialistDispatchInput, SPECIALIST_ROLES, generateFlowMarkdown, scraperPublicUrl, buildMultipart, jsonSafe, extractAssistantResult, extractAdviserAdvice, extractSpecialistResult, resolveKnowledgeIds } from '../src/pentagi.mjs'
 import { applyLlmToEnvText } from '../src/pentagi-providers.mjs'
 import { pentestImage, whichDocker, pentagiSandboxEnabled, pentagiDindEnabled } from '../src/pentagi-runtime.mjs'
 
@@ -629,6 +629,23 @@ test('sandbox wraps host Tor loopback so 127.0.0.1:9050 reaches the Mac daemon',
   assert.match(wrapped, /curl --socks5-hostname 127\.0\.0\.1:9050/)
 })
 
+test('persistent Kali sandbox keeps /work and /tmp across execs', () => {
+  const args = buildPersistentSandboxCreateArgs({
+    workHost: '/tmp/work',
+    tmpHost: '/tmp/sandbox-tmp',
+    dind: true,
+    image: 'vxcontrol/kali-linux',
+  })
+  assert.equal(args[0], 'run')
+  assert.ok(args.includes('-d'))
+  assert.ok(args.includes('--name'))
+  assert.ok(args.includes(SANDBOX_CONTAINER_NAME))
+  assert.ok(args.includes('/tmp/work:/work'))
+  assert.ok(args.includes('/tmp/sandbox-tmp:/tmp'))
+  assert.ok(args.includes('host.docker.internal:host-gateway'))
+  assert.ok(!args.includes('--rm'))
+})
+
 test('knowledge search GraphQL matches official schema (no withContent)', () => {
   assert.equal(KNOWLEDGE_SEARCH_GQL.includes('withContent'), false)
   assert.match(KNOWLEDGE_SEARCH_GQL, /searchKnowledge\(query: \$query, limit: \$limit\)/)
@@ -747,6 +764,36 @@ test('extractSpecialistResult prefers the adviser agentLog over enricher facts',
   assert.match(extractSpecialistResult('adviser', logs, agents), /senior mentor/)
 })
 
+test('extractAdviserAdvice returns the mentor final answer without an agentLog dump', () => {
+  const logs = [
+    { type: 'answer', message: "I'll send this to the senior mentor now." },
+    { type: 'advice', message: 'Delegating the supervision smoke test to the senior mentor.', result: '' },
+  ]
+  const agents = [
+    { initiator: 'assistant', executor: 'enricher', result: 'Kali 2025.4 nmap 7.98' },
+    { initiator: 'assistant', executor: 'adviser', result: '(1) senior mentor (2) yes (3) nmap -sn 127.0.0.1' },
+  ]
+  const hit = extractAdviserAdvice(logs, agents, [])
+  assert.equal(hit.source, 'agentLog')
+  assert.match(hit.advice, /senior mentor/)
+  assert.equal(Object.hasOwn(jsonSafe({ advice: hit.advice, result: hit.advice, logs: undefined, agents: undefined }), 'logs'), false)
+})
+
+test('extractAdviserAdvice falls back to adviceLog result then advice toolCall', () => {
+  const logs = [
+    { type: 'advice', message: 'Delegating.', result: '' },
+    { type: 'advice', message: 'Asking mentor.', result: 'Review the nmap timing first.' },
+  ]
+  assert.equal(extractAdviserAdvice(logs, [], []).source, 'adviceLog')
+  assert.match(extractAdviserAdvice(logs, [], []).advice, /nmap timing/)
+  const toolcalls = [
+    { name: 'terminal', result: 'not advice' },
+    { name: 'advice', result: 'Pivot to a smaller PoC.' },
+  ]
+  assert.equal(extractAdviserAdvice([{ type: 'advice', message: 'Delegating.' }], [], toolcalls).source, 'toolCall')
+  assert.match(extractAdviserAdvice([{ type: 'advice', message: 'Delegating.' }], [], toolcalls).advice, /smaller PoC/)
+})
+
 test('resolveKnowledgeIds maps local k-* ids onto the official UUID', () => {
   const store = {
     documents: [{
@@ -783,6 +830,31 @@ test('pg_pentester falls back to a local stub when the official token is missing
     assert.notEqual(result.reason, undefined)
     assert.ok(Array.isArray(result.playbook))
     assert.ok(result.playbook[0].includes('pg_search_in_memory'))
+  } finally {
+    isolated.restore()
+  }
+})
+
+test('pg_advice local stub surfaces counsel as advice without an agentLog dump', async () => {
+  const isolated = isolateHome()
+  try {
+    const env = {
+      ...process.env,
+      DSH_HOME: isolated.home,
+      DSH_PENTAGI_URL: 'https://127.0.0.1:1',
+    }
+    delete env.DSH_PENTAGI_TOKEN
+    const result = await runPentagiTool('pg_advice', {
+      question: 'What should I do next after nmap hangs?',
+      message: 'mentor stub',
+    }, env)
+    assert.equal(result.dispatched, false)
+    assert.equal(result.role, 'adviser')
+    assert.equal(result.source, 'local')
+    assert.match(result.advice, /pg_terminal/)
+    assert.equal(result.advice, result.result)
+    assert.equal(result.logs, undefined)
+    assert.equal(result.agents, undefined)
   } finally {
     isolated.restore()
   }

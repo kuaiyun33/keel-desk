@@ -407,7 +407,7 @@ export const PENTAGI_TOOLS = [
   },
   {
     name: 'pg_terminal',
-    description: 'Run a shell command (PentAGI terminal). Blocking unless detach=true. Prefer this over writing commands in prose.',
+    description: 'Run a shell command (PentAGI terminal). Kali sandbox is a long-lived container: /work and /tmp persist across calls (cookies, captcha, /tmp scripts). Blocking unless detach=true. Prefer this over writing commands in prose.',
     parameters: {
       type: 'object',
       properties: {
@@ -415,7 +415,7 @@ export const PENTAGI_TOOLS = [
         cwd: { type: 'string', description: 'Working directory' },
         detach: { type: 'boolean', description: 'Run in background (no stdout capture)' },
         timeout: { type: 'integer', description: 'Seconds, 0 = 60s default, max 10800' },
-        sandbox: { type: 'boolean', description: 'Run inside vxcontrol/kali-linux (https://github.com/vxcontrol/kali-linux-image). Default follows Settings → 启用 Kali 沙箱.' },
+        sandbox: { type: 'boolean', description: 'Run inside the persistent vxcontrol/kali-linux sandbox (https://github.com/vxcontrol/kali-linux-image). /work and /tmp survive across calls. Default follows Settings → 启用 Kali 沙箱.' },
         message: requiredString('Why this command'),
       },
       required: ['input', 'message'],
@@ -716,7 +716,7 @@ export const PENTAGI_TOOLS = [
   },
   {
     name: 'pg_advice',
-    description: 'Ask the official PentAGI senior mentor (advice tool on a useAgents assistant). Falls back to local counsel if the backend is down.',
+    description: 'Ask the official PentAGI senior mentor. Returns the mentor final answer in `advice` (also `result`) without requiring a separate agentLog lookup. Falls back to local counsel if the backend is down.',
     parameters: {
       type: 'object',
       properties: {
@@ -1347,20 +1347,37 @@ export function flowFilesRestPath(flowId, suffix = '') {
 
 /** Host Tor SOCKS (and Browser SOCKS) — Kali 127.0.0.1 is the container, not the Mac. */
 export const HOST_LOOPBACK_FORWARD_PORTS = [9050, 9150]
+export const SANDBOX_CONTAINER_NAME = 'dsh-kali-sandbox'
 
-export function wrapSandboxHostLoopback(input) {
-  const forwards = HOST_LOOPBACK_FORWARD_PORTS.map((port) => (
-    `socat TCP-LISTEN:${port},bind=127.0.0.1,fork,reuseaddr TCP:host.docker.internal:${port} >/tmp/dsh-socat-${port}.log 2>&1 &`
-  )).join('\n')
+export function wrapSandboxHostLoopback(input, { ensureOnly = false } = {}) {
+  const forwards = [
+    'mkdir -p /work/.tmp /tmp',
+    ...HOST_LOOPBACK_FORWARD_PORTS.map((port) => (
+      `if ! python3 -c "import socket;s=socket.socket();s.settimeout(0.2);s.connect(('127.0.0.1',${port}))" 2>/dev/null; then nohup socat TCP-LISTEN:${port},bind=127.0.0.1,fork,reuseaddr TCP:host.docker.internal:${port} >/work/.tmp/dsh-socat-${port}.log 2>&1 & fi`
+    )),
+  ].join('\n')
+  if (ensureOnly) return `${forwards}\nsleep 0.15`
   return `${forwards}\nsleep 0.15\n${input}`
 }
 
-export function buildSandboxDockerArgs({ detach, workHost, workInContainer, dind, image, input }) {
+export function buildPersistentSandboxCreateArgs({ workHost, tmpHost, dind, image }) {
+  const dockerArgs = ['run', '-d', '--name', SANDBOX_CONTAINER_NAME, '--restart', 'unless-stopped', '--cap-drop', 'ALL']
+  for (const cap of SANDBOX_CAP_ADD) dockerArgs.push('--cap-add', cap)
+  dockerArgs.push('--add-host', 'host.docker.internal:host-gateway')
+  dockerArgs.push('-v', `${workHost}:/work`)
+  dockerArgs.push('-v', `${tmpHost}:/tmp`)
+  if (dind) dockerArgs.push('-v', `${dockerSocketInVm()}:/var/run/docker.sock`)
+  dockerArgs.push('--entrypoint', 'sh', '-w', '/work', image, '-lc', `${wrapSandboxHostLoopback('', { ensureOnly: true })}\nexec tail -f /dev/null`)
+  return dockerArgs
+}
+
+export function buildSandboxDockerArgs({ detach, workHost, workInContainer, dind, image, input, tmpHost }) {
   const dockerArgs = ['run', '--rm', '--cap-drop', 'ALL']
   for (const cap of SANDBOX_CAP_ADD) dockerArgs.push('--cap-add', cap)
   if (detach === true) dockerArgs.push('-d')
   dockerArgs.push('--add-host', 'host.docker.internal:host-gateway')
   dockerArgs.push('-v', `${workHost}:/work`)
+  if (tmpHost) dockerArgs.push('-v', `${tmpHost}:/tmp`)
   if (dind) dockerArgs.push('-v', `${dockerSocketInVm()}:/var/run/docker.sock`)
   dockerArgs.push('-w', workInContainer, image, 'sh', '-lc', wrapSandboxHostLoopback(input))
   return dockerArgs
@@ -1370,11 +1387,38 @@ function sandboxWorkDir(args, env = process.env) {
   const configured = String(env.DSH_PENTAGI_SANDBOX_WORKDIR ?? '').trim()
   if (configured) return resolve(configured)
   const requested = String(args.cwd ?? '').trim()
-  if (requested && !requested.startsWith('/work')) {
+  if (requested && !requested.startsWith('/work') && !requested.startsWith('/tmp')) {
     const hostPath = resolve(requested)
     if (existsSync(hostPath)) return hostPath
   }
   return join(userHome(env), 'pentagi', 'sandbox-work')
+}
+
+function sandboxTmpDir(env = process.env) {
+  const dir = join(userHome(env), 'pentagi', 'sandbox-tmp')
+  mkdirSync(dir, { recursive: true })
+  return dir
+}
+
+async function sandboxContainerRunning(dockerBin, dockerEnv) {
+  const inspect = await spawnCommand(dockerBin, ['inspect', '-f', '{{.State.Running}}', SANDBOX_CONTAINER_NAME], { timeoutMs: 8_000, env: dockerEnv })
+  return inspect.ok && inspect.stdout.trim() === 'true'
+}
+
+async function ensurePersistentSandbox({ dockerBin, dockerEnv, image, workHost, tmpHost, dind }) {
+  mkdirSync(join(workHost, '.tmp'), { recursive: true })
+  if (await sandboxContainerRunning(dockerBin, dockerEnv)) {
+    await spawnCommand(dockerBin, ['exec', SANDBOX_CONTAINER_NAME, 'sh', '-lc', wrapSandboxHostLoopback('', { ensureOnly: true })], { timeoutMs: 8_000, env: dockerEnv })
+    return { created: false }
+  }
+  await spawnCommand(dockerBin, ['rm', '-f', SANDBOX_CONTAINER_NAME], { timeoutMs: 15_000, env: dockerEnv })
+  const createArgs = buildPersistentSandboxCreateArgs({ workHost, tmpHost, dind, image })
+  const created = await spawnCommand(dockerBin, createArgs, { timeoutMs: 30_000, env: dockerEnv })
+  if (!created.ok) {
+    return { created: false, error: created.stderr || created.stdout || 'failed to start persistent kali sandbox', code: created.code }
+  }
+  await spawnCommand(dockerBin, ['exec', SANDBOX_CONTAINER_NAME, 'sh', '-lc', wrapSandboxHostLoopback('', { ensureOnly: true })], { timeoutMs: 8_000, env: dockerEnv })
+  return { created: true, id: created.stdout.trim() }
 }
 
 async function runTerminal(args, env = process.env) {
@@ -1416,24 +1460,46 @@ async function runTerminal(args, env = process.env) {
     }
     const workHost = sandboxWorkDir(args, env)
     mkdirSync(workHost, { recursive: true })
-    const workInContainer = String(args.cwd ?? '').startsWith('/work') ? String(args.cwd) : '/work'
+    const tmpHost = sandboxTmpDir(env)
+    const requested = String(args.cwd ?? '').trim()
+    const workInContainer = requested.startsWith('/work') || requested.startsWith('/tmp') ? requested : '/work'
     const dind = pentagiDindEnabled(env)
-    const dockerArgs = buildSandboxDockerArgs({
-      detach: args.detach === true,
-      workHost,
-      workInContainer,
-      dind,
-      image,
-      input,
-    })
-    const result = await spawnCommand(dockerBin, dockerArgs, { timeoutMs, env: dockerEnv })
+    const ready = await ensurePersistentSandbox({ dockerBin, dockerEnv, image, workHost, tmpHost, dind })
+    if (ready.error) {
+      return { ok: false, sandbox: true, persistent: true, image, bin: dockerBin, work: workHost, tmp: tmpHost, error: ready.error, code: ready.code, input }
+    }
+    const execArgs = ['exec', '-w', workInContainer, SANDBOX_CONTAINER_NAME, 'sh', '-lc', wrapSandboxHostLoopback(input)]
+    if (args.detach === true) {
+      const detached = await spawnCommand(dockerBin, [...execArgs.slice(0, -1), wrapSandboxHostLoopback(`${input} >/work/.tmp/detach.log 2>&1 & echo $!`)], { timeoutMs: 8_000, env: dockerEnv })
+      return {
+        ok: detached.ok,
+        sandbox: true,
+        persistent: true,
+        container: SANDBOX_CONTAINER_NAME,
+        image,
+        bin: dockerBin,
+        work: workHost,
+        tmp: tmpHost,
+        dind,
+        detached: true,
+        input,
+        stdout: detached.stdout.slice(0, 8_000),
+        stderr: detached.stderr.slice(0, 4_000),
+        message: args.message,
+      }
+    }
+    const result = await spawnCommand(dockerBin, execArgs, { timeoutMs, env: dockerEnv })
     return {
       ok: result.ok,
       sandbox: true,
+      persistent: true,
+      container: SANDBOX_CONTAINER_NAME,
       image,
       bin: dockerBin,
       work: workHost,
+      tmp: tmpHost,
       dind,
+      created: Boolean(ready.created),
       code: result.code,
       input,
       stdout: result.stdout.slice(0, 80_000),
@@ -1610,14 +1676,18 @@ function specialistStub(role, question, extra = {}) {
     next,
   }
   if (role === 'adviser') {
+    const counsel = [
+      'Reproduce with the smallest command (pg_terminal).',
+      'Diff expected vs actual (pg_file + pg_browser).',
+      'Search public PoCs (pg_sploitus / pg_web_search mode=exploit).',
+      'Do not claim a vuln without a returning proof (status/body/timing).',
+    ]
     return {
       ...base,
-      counsel: [
-        'Reproduce with the smallest command (pg_terminal).',
-        'Diff expected vs actual (pg_file + pg_browser).',
-        'Search public PoCs (pg_sploitus / pg_web_search mode=exploit).',
-        'Do not claim a vuln without a returning proof (status/body/timing).',
-      ],
+      counsel,
+      source: 'local',
+      advice: counsel.join('\n'),
+      result: counsel.join('\n'),
       ...extra,
     }
   }
@@ -1644,16 +1714,40 @@ export function extractAssistantResult(logs = []) {
   return ''
 }
 
-export function extractSpecialistResult(kind, logs = [], agents = []) {
+function usableAdviceText(value) {
+  const text = String(value ?? '').trim()
+  if (!text) return ''
+  if (ASSISTANT_NARRATION_RE.test(text)) return ''
+  return text
+}
+
+/** Mentor final answer from official advice channels — not assistant narration. */
+export function extractAdviserAdvice(logs = [], agents = [], toolcalls = []) {
+  const agentHit = [...agents].reverse().find(item => item?.executor === 'adviser' && usableAdviceText(item.result))
+  if (agentHit) return { advice: usableAdviceText(agentHit.result), source: 'agentLog' }
+
+  const adviceHit = [...logs].reverse().find(item => item?.type === 'advice' && usableAdviceText(item.result))
+  if (adviceHit) return { advice: usableAdviceText(adviceHit.result), source: 'adviceLog' }
+
+  const tcHit = [...toolcalls].reverse().find((item) => {
+    const name = String(item?.name || '').trim()
+    return name === 'advice' && usableAdviceText(item.result)
+  })
+  if (tcHit) return { advice: usableAdviceText(tcHit.result), source: 'toolCall' }
+
+  return { advice: '', source: '' }
+}
+
+export function extractSpecialistResult(kind, logs = [], agents = [], toolcalls = []) {
   if (kind === 'adviser') {
-    const hit = [...agents].reverse().find(item => item?.executor === 'adviser' && String(item.result || '').trim())
-    if (hit) return String(hit.result)
+    const hit = extractAdviserAdvice(logs, agents, toolcalls)
+    if (hit.advice) return hit.advice
   }
   return extractAssistantResult(logs)
 }
 
-function adviserLogPresent(agents = []) {
-  return (agents ?? []).some(item => item?.executor === 'adviser' && String(item.result || '').trim())
+function adviserAdvicePresent(logs = [], agents = [], toolcalls = []) {
+  return Boolean(extractAdviserAdvice(logs, agents, toolcalls).advice)
 }
 
 export function resolveKnowledgeIds(store, id) {
@@ -1716,29 +1810,31 @@ async function ensureRemoteFlow(env) {
   return { flowId: id ? String(id) : '', created: true, remote: created }
 }
 
-const ASSISTANT_WATCH_GQL = 'query WatchAsst($flowId: ID!, $assistantId: ID!) { assistants(flowId: $flowId) { id title status useAgents updatedAt } assistantLogs(flowId: $flowId, assistantId: $assistantId) { id type message result createdAt } agentLogs(flowId: $flowId) { id initiator executor task result createdAt } }'
+const ASSISTANT_WATCH_GQL = 'query WatchAsst($flowId: ID!, $assistantId: ID!) { assistants(flowId: $flowId) { id title status useAgents updatedAt } assistantLogs(flowId: $flowId, assistantId: $assistantId) { id type message result createdAt } agentLogs(flowId: $flowId) { id initiator executor task result createdAt } toolCallLogs(flowId: $flowId) { id name status result createdAt } }'
 
 async function pollOfficialAssistant(flowId, assistantId, env, timeoutMs = SPECIALIST_POLL_MS, kind = '') {
   const deadline = Date.now() + Math.max(5_000, timeoutMs)
-  let snapshot = { status: 'running', logs: [], agents: [], assistants: [] }
+  let snapshot = { status: 'running', logs: [], agents: [], toolcalls: [], assistants: [] }
   while (Date.now() < deadline) {
     const watch = await graphql(ASSISTANT_WATCH_GQL, { flowId, assistantId }, env)
     const assistants = watch.json?.data?.assistants ?? []
     const match = assistants.find(item => String(item.id) === String(assistantId)) || assistants[0] || {}
     const logs = watch.json?.data?.assistantLogs ?? []
     const agents = watch.json?.data?.agentLogs ?? []
+    const toolcalls = watch.json?.data?.toolCallLogs ?? []
     snapshot = {
       ok: watch.ok,
       status: match.status || 'running',
       useAgents: match.useAgents,
       logs,
       agents: agents.slice(-40),
+      toolcalls: toolcalls.slice(-40),
       assistants,
       remote: watch,
     }
     const settled = ['waiting', 'finished', 'failed'].includes(snapshot.status)
     if (settled) {
-      if (kind === 'adviser' && snapshot.status !== 'failed' && !adviserLogPresent(snapshot.agents) && Date.now() < deadline) {
+      if (kind === 'adviser' && snapshot.status !== 'failed' && !adviserAdvicePresent(snapshot.logs, snapshot.agents, snapshot.toolcalls) && Date.now() < deadline) {
         await delay(SPECIALIST_POLL_INTERVAL_MS)
         continue
       }
@@ -1746,7 +1842,8 @@ async function pollOfficialAssistant(flowId, assistantId, env, timeoutMs = SPECI
     }
     await delay(SPECIALIST_POLL_INTERVAL_MS)
   }
-  snapshot.result = extractSpecialistResult(kind, snapshot.logs, snapshot.agents)
+  snapshot.result = extractSpecialistResult(kind, snapshot.logs, snapshot.agents, snapshot.toolcalls)
+  snapshot.advice = kind === 'adviser' ? extractAdviserAdvice(snapshot.logs, snapshot.agents, snapshot.toolcalls) : null
   snapshot.supervision = (snapshot.agents ?? []).map(item => `${item.initiator}→${item.executor}`).filter(Boolean)
   return snapshot
 }
@@ -1806,6 +1903,34 @@ async function dispatchSpecialist(kind, args, env) {
     : (kind === 'adviser' ? SPECIALIST_ADVISER_POLL_MS : SPECIALIST_POLL_MS)
   const watch = await pollOfficialAssistant(flowInfo.flowId, assistantId, env, timeoutMs, kind)
   const settled = ['waiting', 'finished', 'failed'].includes(watch.status)
+  if (kind === 'adviser') {
+    const extracted = watch.advice || extractAdviserAdvice(watch.logs, watch.agents, watch.toolcalls)
+    const advice = String(extracted.advice || watch.result || '').trim()
+    const payload = {
+      ok: created.ok && watch.status !== 'failed',
+      dispatched: true,
+      role: spec.role,
+      tool: spec.tool,
+      question,
+      flowId: flowInfo.flowId,
+      assistantId,
+      provider,
+      useAgents: true,
+      status: watch.status,
+      settled,
+      source: extracted.source || (advice ? 'assistant' : ''),
+      advice,
+      result: advice,
+      supervision: watch.supervision ?? [],
+      message: args.message ?? '',
+    }
+    if (!advice) {
+      payload.hint = settled
+        ? 'Mentor finished without a final answer.'
+        : 'Official assistant still running; pg_advice waits up to 180s for the mentor final answer.'
+    }
+    return payload
+  }
   const payload = {
     ok: created.ok && watch.status !== 'failed',
     dispatched: true,
