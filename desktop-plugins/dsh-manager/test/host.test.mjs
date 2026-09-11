@@ -6,6 +6,9 @@ import { join } from 'node:path'
 
 import { apply, matchProfileId, name, settingsFile, normalizeArmorMode } from '../src/index.mjs'
 import { REVERIFY_TOOLS, probeReverify, runReverifyTool, resolveHostPython } from '../src/reverify.mjs'
+import { runPentagiTool, buildSandboxDockerArgs, flowFilesRestPath, KNOWLEDGE_SEARCH_GQL, SANDBOX_CAP_ADD, formatSpecialistDispatchInput, SPECIALIST_ROLES, generateFlowMarkdown, scraperPublicUrl, buildMultipart, jsonSafe } from '../src/pentagi.mjs'
+import { applyLlmToEnvText } from '../src/pentagi-providers.mjs'
+import { pentestImage, whichDocker, pentagiSandboxEnabled, pentagiDindEnabled } from '../src/pentagi-runtime.mjs'
 
 /** 把 DSH_HOME 指到临时目录，避免测到仓库根 / 安装包里的桌面设置。 */
 function isolateHome() {
@@ -551,6 +554,187 @@ test('coldbrew default toggle persists under DSH_HOME after the install tree is 
       session: { header: {}, requestHeader: () => undefined },
     }
     assert.ok(provider({ scope: agent }).length > 0, '升级冲掉安装树后总开关仍须生效')
+  } finally {
+    isolated.restore()
+  }
+})
+
+test('pentest sandbox image defaults to official vxcontrol/kali-linux', () => {
+  assert.equal(pentestImage({}), 'vxcontrol/kali-linux')
+  assert.equal(pentestImage({ DSH_PENTAGI_PENTEST_IMAGE: 'myorg/kali:openvas' }), 'myorg/kali:openvas')
+})
+
+test('sandbox defaults on and dind defaults off unless env/settings say otherwise', () => {
+  const isolated = isolateHome()
+  try {
+    const env = { ...process.env, DSH_HOME: isolated.home }
+    delete env.DSH_PENTAGI_SANDBOX
+    delete env.DSH_PENTAGI_DIND
+    assert.equal(pentagiSandboxEnabled(env), true)
+    assert.equal(pentagiDindEnabled(env), false)
+    writeFileSync(isolated.settingsPath, JSON.stringify({ coldbrew: { pentagi: { sandbox: false, dind: true } } }))
+    assert.equal(pentagiSandboxEnabled(env), false)
+    assert.equal(pentagiDindEnabled(env), true)
+    assert.equal(pentagiDindEnabled({ ...env, DSH_PENTAGI_DIND: '0' }), false)
+  } finally {
+    isolated.restore()
+  }
+})
+
+test('pg_terminal sandbox finds docker via EXTRA_PATH when GUI PATH is stripped', async () => {
+  const env = { ...process.env, PATH: '/usr/bin:/bin' }
+  const bin = whichDocker('docker', env)
+  if (bin === 'docker' || !existsSync(bin)) return
+  const result = await runPentagiTool('pg_terminal', {
+    input: 'true',
+    sandbox: true,
+    timeout: 8,
+    message: 'path probe',
+  }, env)
+  assert.notEqual(result.error, 'docker not available for sandbox terminal')
+  assert.equal(result.bin, bin)
+  assert.equal(result.image, 'vxcontrol/kali-linux')
+  assert.ok(result.ok === true || /is not pulled/.test(String(result.error ?? '')))
+})
+
+test('Kali sandbox docker args drop ALL then add official pentest caps including NET_RAW', () => {
+  const args = buildSandboxDockerArgs({
+    detach: false,
+    workHost: '/tmp/work',
+    workInContainer: '/work',
+    dind: true,
+    image: 'vxcontrol/kali-linux',
+    input: 'nmap -V',
+  })
+  assert.deepEqual(args.slice(0, 4), ['run', '--rm', '--cap-drop', 'ALL'])
+  assert.ok(SANDBOX_CAP_ADD.includes('NET_RAW'))
+  assert.ok(SANDBOX_CAP_ADD.includes('NET_ADMIN'))
+  for (const cap of SANDBOX_CAP_ADD) {
+    const idx = args.indexOf('--cap-add')
+    assert.ok(idx >= 0, `missing --cap-add ${cap}`)
+    assert.ok(args.includes(cap), `cap ${cap} not in docker args`)
+  }
+  assert.ok(args.includes('/var/run/docker.sock:/var/run/docker.sock') || args.some(v => v.includes('docker.sock')))
+  assert.equal(args.at(-4), 'vxcontrol/kali-linux')
+  assert.equal(args.at(-1), 'nmap -V')
+})
+
+test('knowledge search GraphQL matches official schema (no withContent)', () => {
+  assert.equal(KNOWLEDGE_SEARCH_GQL.includes('withContent'), false)
+  assert.match(KNOWLEDGE_SEARCH_GQL, /searchKnowledge\(query: \$query, limit: \$limit\)/)
+})
+
+test('flow files REST list path has the trailing slash the backend 301s toward', () => {
+  assert.equal(flowFilesRestPath('4'), '/api/v1/flows/4/files/')
+  assert.equal(flowFilesRestPath('4', 'container'), '/api/v1/flows/4/files/container')
+  assert.equal(flowFilesRestPath('4', '/download'), '/api/v1/flows/4/files/download')
+  assert.equal(flowFilesRestPath('4', 'pull'), '/api/v1/flows/4/files/pull')
+  assert.equal(flowFilesRestPath('4', 'resources'), '/api/v1/flows/4/files/resources')
+  assert.equal(flowFilesRestPath('4', 'to-resources'), '/api/v1/flows/4/files/to-resources')
+})
+
+test('multipart builder uses files field and a closed boundary', () => {
+  const { body, contentType, boundary } = buildMultipart([{ filename: 'note.txt', body: 'hello' }])
+  const text = body.toString('utf8')
+  assert.match(contentType, /multipart\/form-data; boundary=/)
+  assert.match(text, /name="files"; filename="note.txt"/)
+  assert.match(text, /hello/)
+  assert.match(text, new RegExp(`--${boundary}--`))
+})
+
+test('specialist dispatch input names the official tool and stays English', () => {
+  assert.equal(SPECIALIST_ROLES.pentester.tool, 'pentester')
+  assert.equal(SPECIALIST_ROLES.coder.tool, 'coder')
+  assert.equal(SPECIALIST_ROLES.maintenance.tool, 'installer')
+  assert.equal(SPECIALIST_ROLES.adviser.tool, 'advice')
+  assert.equal(SPECIALIST_ROLES.searcher.tool, 'search')
+  const text = formatSpecialistDispatchInput('pentester', 'Print nmap version only. Do not scan.')
+  assert.match(text, /official `pentester` tool/)
+  assert.match(text, /useAgents is enabled/)
+  assert.match(text, /Print nmap version only/)
+})
+
+test('LLM env sync writes embedding independently of the chat scheduler', () => {
+  const pick = {
+    baseURL: 'http://127.0.0.1:3000/v1',
+    key: 'sk-test',
+    model: 'grok-pro',
+    probe: { model: 'grok-pro' },
+    healthy: true,
+  }
+  const none = applyLlmToEnvText('LLM_SERVER_URL=old\n', pick, { embedding: { ok: false, source: 'none' } })
+  assert.match(none, /LLM_SERVER_MODEL=grok-pro/)
+  assert.match(none, /EMBEDDING_PROVIDER=none/)
+  const api = applyLlmToEnvText(none, pick, {
+    embedding: { ok: true, source: 'api', url: 'https://api.siliconflow.cn/v1', key: 'sk-sf', model: 'BAAI/bge-m3' },
+  })
+  assert.match(api, /EMBEDDING_PROVIDER=openai/)
+  assert.match(api, /EMBEDDING_URL=https:\/\/api.siliconflow.cn\/v1/)
+  assert.match(api, /EMBEDDING_MODEL=BAAI\/bge-m3/)
+  assert.match(api, /LLM_SERVER_MODEL=grok-pro/)
+  const local = applyLlmToEnvText(api, pick, {
+    embedding: { ok: true, source: 'local', url: 'http://host.docker.internal:63229/v1', key: 'sk-dsh-local-embed', model: 'BAAI/bge-small-en-v1.5' },
+  })
+  assert.match(local, /EMBEDDING_URL=http:\/\/host\.docker\.internal:63229\/v1/)
+  assert.match(local, /SCRAPER_PRIVATE_URL=https:\/\/someuser:somepass@scraper\//)
+  assert.match(local, /DOCKER_DEFAULT_IMAGE=vxcontrol\/kali-linux/)
+  assert.match(local, /DOCKER_NET_ADMIN=true/)
+})
+
+test('jsonSafe drops undefined so specialist payloads are lossless JSON', () => {
+  const cleaned = jsonSafe({
+    ok: true,
+    hint: undefined,
+    result: 'PONG',
+    logs: [undefined, { type: 'answer', result: 'PONG' }],
+    local: undefined,
+    nested: { a: 1, b: undefined },
+  })
+  assert.equal(Object.hasOwn(cleaned, 'hint'), false)
+  assert.equal(cleaned.result, 'PONG')
+  assert.equal(cleaned.logs[0], null)
+  assert.equal(cleaned.logs[1].result, 'PONG')
+  assert.equal(Object.hasOwn(cleaned, 'local'), false)
+  assert.deepEqual(cleaned.nested, { a: 1 })
+  assert.equal(JSON.parse(JSON.stringify(cleaned)).result, 'PONG')
+})
+
+test('flow markdown report matches official heading layout', () => {
+  const md = generateFlowMarkdown(
+    { id: 4, title: 'Reply Ping Only', status: 'waiting' },
+    [{ id: 1, title: 'Ping', status: 'finished', input: '# Goal\nping', result: 'pong', subtasks: [{ id: 1, title: 'Reply ping', status: 'finished', description: 'pong only', result: 'pong' }] }],
+  )
+  assert.match(md, /^# ⏳ 4\. Reply Ping Only/m)
+  assert.match(md, /### ✅ 1\. Ping/)
+  assert.match(md, /#### ✅ 1\. Reply ping/)
+  assert.match(md, /pong/)
+})
+
+test('scraper public URL defaults to local 9443', () => {
+  assert.equal(scraperPublicUrl({ DSH_PENTAGI_SCRAPER_URL: '' }), 'https://someuser:somepass@127.0.0.1:9443')
+  assert.equal(scraperPublicUrl({ DSH_PENTAGI_SCRAPER_URL: 'https://user:pass@127.0.0.1:9443/' }), 'https://user:pass@127.0.0.1:9443')
+})
+
+test('pg_pentester falls back to a local stub when the official token is missing and API is down', async () => {
+  const isolated = isolateHome()
+  try {
+    const env = {
+      ...process.env,
+      DSH_HOME: isolated.home,
+      DSH_PENTAGI_TOKEN: '',
+      DSH_PENTAGI_URL: 'https://127.0.0.1:1',
+    }
+    delete env.DSH_PENTAGI_TOKEN
+    const result = await runPentagiTool('pg_pentester', {
+      question: 'Print nmap version only',
+      message: 'stub fallback',
+    }, env)
+    assert.equal(result.dispatched, false)
+    assert.equal(result.role, 'pentester')
+    assert.ok(result.reason, 'expected a mint/API failure reason')
+    assert.notEqual(result.reason, undefined)
+    assert.ok(Array.isArray(result.playbook))
+    assert.ok(result.playbook[0].includes('pg_search_in_memory'))
   } finally {
     isolated.restore()
   }

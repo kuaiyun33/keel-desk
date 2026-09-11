@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process'
+import { existsSync } from 'node:fs'
 import { copyFile, cp, mkdir, readFile, rm } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -8,7 +9,13 @@ const repositoryRoot = dirname(dirname(pluginRoot))
 const outDir = join(pluginRoot, 'lib')
 const clientId = '@deepseek-ai/dsh-desktop-manager'
 
-const esbuildPath = join(repositoryRoot, 'harness', 'node_modules', '.bin', 'esbuild')
+const esbuildCandidates = [
+  join(repositoryRoot, 'harness', 'node_modules', '.bin', 'esbuild'),
+  '/tmp/package/bin/esbuild',
+]
+const esbuildPath = esbuildCandidates.find(p => existsSync(p))
+if (!esbuildPath) throw new Error('esbuild not found')
+
 
 function run(command, args) {
   return new Promise((resolve, reject) => {
@@ -23,6 +30,10 @@ await mkdir(outDir, { recursive: true })
 await copyFile(join(pluginRoot, 'src', 'index.mjs'), join(outDir, 'index.mjs'))
 await copyFile(join(pluginRoot, 'src', 'reverify.mjs'), join(outDir, 'reverify.mjs'))
 await copyFile(join(pluginRoot, 'src', 'reverify-bridge.py'), join(outDir, 'reverify-bridge.py'))
+await copyFile(join(pluginRoot, 'src', 'pentagi.mjs'), join(outDir, 'pentagi.mjs'))
+await copyFile(join(pluginRoot, 'src', 'pentagi-runtime.mjs'), join(outDir, 'pentagi-runtime.mjs'))
+await copyFile(join(pluginRoot, 'src', 'pentagi-providers.mjs'), join(outDir, 'pentagi-providers.mjs'))
+await copyFile(join(pluginRoot, 'src', 'embedder-server.py'), join(outDir, 'embedder-server.py'))
 // 冷咖啡五个 profile 提示词是 host 端运行时资源（lib/index.mjs 相对路径读取）。
 await cp(join(pluginRoot, 'src', 'profiles'), join(outDir, 'profiles'), { recursive: true })
 // Vendored Reverify 0.9.0：纯 Python 核心，host 用系统/venv Python 直接调。

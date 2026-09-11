@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process'
-import { accessSync, copyFileSync, mkdirSync, readFileSync } from 'node:fs'
+import { accessSync, copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { access, mkdir, readFile, writeFile, rm } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
@@ -8,14 +8,29 @@ import { fileURLToPath } from 'node:url'
 import {
   ARMOR_MODES,
   DEFAULT_ARMOR_MODE,
+  PENTAGI_SOURCE,
+  PENTAGI_VERSION,
   REVERIFY_TOOLS,
   REVERIFY_VERSION,
   installReverifyExtras,
   normalizeArmorMode,
   probeReverify,
   runReverifyTool,
-  uninstallReverifyExtras,
 } from './reverify.mjs'
+import { PENTAGI_TOOLS, runPentagiTool } from './pentagi.mjs'
+import {
+  probePentagiRuntime,
+  startPentagiRuntime,
+  stopPentagiRuntime,
+  savePentagiSettings,
+  pentagiStopOnExit,
+  pentagiEnvPath,
+  resolveEmbeddingForEnv,
+  ensureLocalEmbedder,
+  stopLocalEmbedder,
+  installDockerStack,
+} from './pentagi-runtime.mjs'
+import { snapshotHarnessLlms, inspectHarnessLlms, pickHarnessLlm, applyLlmToEnvText, syncGraphqlProviders } from './pentagi-providers.mjs'
 
 export const name = 'dsh-desktop-manager'
 export const inject = ['webServer', 'loader', 'systemPrompt', 'tools']
@@ -75,35 +90,6 @@ function migrateLegacyFile(destPath, legacyPath) {
 
 let taskLogs = []
 let isRunning = false
-let installJob = {
-  extra: null,
-  error: null,
-  result: null,
-  live: '',
-}
-
-function appendTaskLog(line, live = false) {
-  const text = String(line ?? '').trim()
-  if (!text) return
-  if (live) {
-    installJob.live = text
-    return
-  }
-  installJob.live = ''
-  taskLogs.push(text)
-  if (taskLogs.length > 800) taskLogs = taskLogs.slice(-600)
-}
-
-function installStatusPayload() {
-  return {
-    logs: taskLogs,
-    live: installJob.live,
-    isRunning,
-    extra: installJob.extra,
-    error: installJob.error,
-    result: isRunning ? null : installJob.result,
-  }
-}
 
 /**
  * 会话破甲开关的内存态：{ [sessionId]: { enabled, model } }，与 coldbrewStatePath 双向同步。
@@ -134,6 +120,7 @@ const PROFILES = {
     short: '指令层与工作流编排',
     file: 'codex.md',
     reverifyFile: 'codex-reverify.md',
+    pentagiFile: 'codex-pentagi.md',
     // 模型名命中规则（大小写不敏感，取第一个命中）
     patterns: ['gpt', 'codex', 'o1', 'o3'],
   },
@@ -143,6 +130,7 @@ const PROFILES = {
     short: '长会话与规则组织',
     file: 'claude.md',
     reverifyFile: 'claude-reverify.md',
+    pentagiFile: 'claude-pentagi.md',
     patterns: ['claude'],
   },
   grok: {
@@ -151,6 +139,7 @@ const PROFILES = {
     short: '实时信息流与模板',
     file: 'grok.md',
     reverifyFile: 'grok-reverify.md',
+    pentagiFile: 'grok-pentagi.md',
     patterns: ['grok'],
   },
   glm: {
@@ -159,6 +148,7 @@ const PROFILES = {
     short: '破甲越狱与越界重写',
     file: 'glm.md',
     reverifyFile: 'glm-reverify.md',
+    pentagiFile: 'glm-pentagi.md',
     patterns: ['glm', 'chatglm', 'zhipu'],
   },
   deepseek: {
@@ -167,6 +157,7 @@ const PROFILES = {
     short: '深度推理与会话导出',
     file: 'deepseek.md',
     reverifyFile: 'deepseek-reverify.md',
+    pentagiFile: 'deepseek-pentagi.md',
     patterns: ['deepseek'],
   },
 }
@@ -181,9 +172,16 @@ export function matchProfileId(modelName) {
 }
 
 /** 读一份 profile 提示词正文（同步，启动时一次性缓存；正文必须同步求值给 systemPrompt section）。
- *  ColdBrew：五个席位共用 kernel-2.1.0.md；Reverify：共用 kernel-reverify.md。席位文件只保留身份/语气 overlay。 */
+ *  ColdBrew：五个席位共用 kernel-2.1.0.md；Reverify：共用 kernel-reverify.md；PentAGI：共用 kernel-pentagi.md。
+ *  席位文件只保留身份/语气 overlay。 */
 const KERNEL_FILE = 'kernel-2.1.0.md'
 const REVERIFY_KERNEL_FILE = 'kernel-reverify.md'
+const PENTAGI_KERNEL_FILE = 'kernel-pentagi.md'
+const MODE_KERNEL_FILE = {
+  coldbrew: KERNEL_FILE,
+  reverify: REVERIFY_KERNEL_FILE,
+  pentagi: PENTAGI_KERNEL_FILE,
+}
 const promptCache = new Map()
 function loadPromptSync(profile, mode = DEFAULT_ARMOR_MODE) {
   const armorMode = normalizeArmorMode(mode)
@@ -191,8 +189,10 @@ function loadPromptSync(profile, mode = DEFAULT_ARMOR_MODE) {
   if (!promptCache.has(key)) {
     const overlayName = armorMode === 'reverify'
       ? (profile.reverifyFile ?? `${profile.id}-reverify.md`)
-      : profile.file
-    const kernelName = armorMode === 'reverify' ? REVERIFY_KERNEL_FILE : KERNEL_FILE
+      : armorMode === 'pentagi'
+        ? (profile.pentagiFile ?? `${profile.id}-pentagi.md`)
+        : profile.file
+    const kernelName = MODE_KERNEL_FILE[armorMode] ?? KERNEL_FILE
     const overlay = readFileSync(join(profilesDir, overlayName), 'utf8')
     const kernel = readFileSync(join(profilesDir, kernelName), 'utf8')
     promptCache.set(key, `${overlay.trim()}\n\n${kernel}`)
@@ -384,7 +384,80 @@ function run(command, args, options = {}) {
   })
 }
 
+/** 只探测不落日志的 spawn：PentAGI 后端状态查询用。 */
+function spawnProbe(command, args, timeoutMs = 8_000) {
+  return new Promise((resolvePromise) => {
+    let stdout = ''
+    let stderr = ''
+    let settled = false
+    const child = spawn(command, args, { env: process.env, shell: false })
+    const timer = setTimeout(() => {
+      if (settled) return
+      settled = true
+      child.kill('SIGKILL')
+      resolvePromise({ ok: false, stdout, stderr: `${stderr}\ntimed out after ${timeoutMs}ms`.trim() })
+    }, timeoutMs)
+    child.stdout.on('data', chunk => { stdout += chunk.toString() })
+    child.stderr.on('data', chunk => { stderr += chunk.toString() })
+    child.once('error', (error) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolvePromise({ ok: false, stdout, stderr: error.message })
+    })
+    child.once('exit', (code) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolvePromise({ ok: code === 0, stdout, stderr })
+    })
+  })
+}
+
+/**
+ * PentAGI 后端探测（只读、快速、永不抛错）：
+ * 1. docker 是否在场（pentagi 官方部署方式是 docker compose）；
+ * 2. 默认 API/UI 地址 https://127.0.0.1:8443 是否可到达（可通过 DSH_PENTAGI_URL 覆盖）。
+ * 探测失败只标记字段，不阻断工具调用。
+ */
+async function probePentagi() {
+  try {
+    return await probePentagiRuntime()
+  } catch (error) {
+    return {
+      version: PENTAGI_VERSION,
+      source: PENTAGI_SOURCE,
+      error: String(error?.message ?? error),
+      docker: { ok: false },
+      api: { ok: false, url: 'https://127.0.0.1:8443' },
+      backendReady: false,
+    }
+  }
+}
+
 export function apply(ctx) {
+  // Harness 起来后按设置决定是否后台拉 compose。stopOnExit=true 时进程退出会 down。
+  const pentagiCfg = (() => {
+    try { return loadSettingsSync()?.coldbrew?.pentagi ?? {} } catch { return {} }
+  })()
+  if (pentagiCfg.autostart !== false) {
+    setTimeout(() => {
+      startPentagiRuntime((line) => {
+        taskLogs.push(line)
+        if (taskLogs.length > 400) taskLogs = taskLogs.slice(-300)
+      }).catch((error) => {
+        taskLogs.push(`pentagi autostart: ${error?.message ?? error}`)
+      })
+    }, 1500)
+  }
+  const shutdown = () => {
+    if (!pentagiStopOnExit()) return
+    stopPentagiRuntime((line) => taskLogs.push(line)).catch(() => {})
+  }
+  process.once('exit', shutdown)
+  process.once('SIGINT', () => { shutdown(); process.exit(0) })
+  process.once('SIGTERM', () => { shutdown(); process.exit(0) })
+
   // 按会话注入系统提示词：文本提供器在每次组装时以该会话的 agent 为 scope 求值，
   // 会话开关开启且模型命中某个 profile 时返回对应破甲正文，否则返回空串（不贡献内容）。
   // 任何内部异常都回落空串——组装路径上抛错会打断整个 turn。
@@ -417,17 +490,46 @@ export function apply(ctx) {
         patterns: profile.patterns,
         prompt: loadPromptSync(profile, DEFAULT_ARMOR_MODE),
         reverifyPrompt: loadPromptSync(profile, 'reverify'),
+        pentagiPrompt: loadPromptSync(profile, 'pentagi'),
       }))
       return {
         version: '2.1.0',
         control: 'BREAK//OPEN',
         modes: ARMOR_MODES,
         reverifyVersion: REVERIFY_VERSION,
+        pentagi: { version: PENTAGI_VERSION, source: PENTAGI_SOURCE },
         profiles,
         defaultProfile: 'deepseek',
       }
     },
   }), 'dsh-desktop-manager: coldbrew profiles tool')
+
+  // 工具：PentAGI 模式下的 profile 与后端状态查询（同 coldbrew_profiles 型）。
+  ctx.effect(() => ctx.tools.register({
+    name: 'pentagi_profiles',
+    description: 'Return the PentAGI 破甲 profiles (system prompt + backend probe) for the five models.',
+    parameters: { type: 'object', properties: {}, additionalProperties: false },
+    output: {
+      schema: { type: 'object', additionalProperties: true },
+      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
+    },
+    async execute() {
+      return {
+        version: PENTAGI_VERSION,
+        control: 'orchestrate',
+        source: PENTAGI_SOURCE,
+        backend: await probePentagi(),
+        profiles: Object.values(PROFILES).map(profile => ({
+          id: profile.id,
+          name: profile.name,
+          short: profile.short,
+          patterns: profile.patterns,
+          prompt: loadPromptSync(profile, 'pentagi'),
+        })),
+        defaultProfile: 'deepseek',
+      }
+    },
+  }), 'dsh-desktop-manager: pentagi profiles tool')
 
   // Reverify MCP 有的工具返回 object，有的返回 array（re_disasm）。
   // 无约束 JSON schema 才能让两种都通过 tools 输出校验。
@@ -443,6 +545,20 @@ export function apply(ctx) {
       output: jsonOutput,
       async execute(args) {
         return runReverifyTool(tool.name, args ?? {})
+      },
+    }), `dsh-desktop-manager: ${tool.name}`)
+  }
+
+  // PentAGI 原项目工具桥：开启 pentagi 模式后模型直接调 pg_*，不必等 Docker。
+  // 有 DSH_PENTAGI_TOKEN 时 flow_* 走 GraphQL；其余工具本机执行（terminal/browser/search/memory）。
+  for (const tool of PENTAGI_TOOLS) {
+    ctx.effect(() => ctx.tools.register({
+      name: tool.name,
+      description: tool.description,
+      parameters: tool.parameters,
+      output: jsonOutput,
+      async execute(args) {
+        return runPentagiTool(tool.name, args ?? {})
       },
     }), `dsh-desktop-manager: ${tool.name}`)
   }
@@ -542,8 +658,10 @@ export function apply(ctx) {
             modes: [
               { id: 'coldbrew', name: '冷咖啡 ColdBrew 2.1.0', control: 'BREAK//OPEN' },
               { id: 'reverify', name: 'Reverify 0.9.0', control: 'bytes-as-judge' },
+              { id: 'pentagi', name: 'PentAGI 1.0.0', control: 'orchestrate' },
             ],
             reverify: await probeReverify(),
+            pentagi: await probePentagi(),
             profiles: Object.values(PROFILES).map(p => ({
               id: p.id,
               name: p.name,
@@ -566,10 +684,18 @@ export function apply(ctx) {
             || (matched !== null
               && settings.coldbrew?.profiles?.[matched]?.defaultEnabled === true)
           const persisted = sessionId ? sessions[String(sessionId)] : undefined
-          const mode = persisted ? sessionArmorMode(persisted, settings) : settingsArmorMode(settings)
+          const blank = url.searchParams.get('blank') === '1' || url.searchParams.get('blank') === 'true'
+          // 空白会话始终跟破甲管理的全局模式；已发过消息的会话锁自己的 mode。
+          const mode = (!persisted || blank)
+            ? settingsArmorMode(settings)
+            : sessionArmorMode(persisted, settings)
           let state = persisted ?? { enabled: defaultEnabled, model, mode }
-          if (persisted === undefined && sessionId) {
-            state = { enabled: defaultEnabled, model, mode }
+          if (sessionId && (persisted === undefined || blank)) {
+            state = {
+              enabled: persisted?.enabled ?? defaultEnabled,
+              model: model || persisted?.model || '',
+              mode,
+            }
             sessions[String(sessionId)] = state
             await saveColdbrewSessions(sessions)
           }
@@ -585,11 +711,39 @@ export function apply(ctx) {
           const sub = segments[3] ?? 'status'
           if (sub === 'logs') {
             res.writeHead(200, { 'Content-Type': 'application/json' })
-            res.end(JSON.stringify(installStatusPayload()))
+            res.end(JSON.stringify({ logs: taskLogs, isRunning }))
             return
           }
           res.writeHead(200, { 'Content-Type': 'application/json' })
           res.end(JSON.stringify(await probeReverify()))
+          return
+        }
+        if (action === 'pentagi') {
+          const sub = segments[3] ?? 'status'
+          if (sub === 'profiles') {
+            res.writeHead(200, { 'Content-Type': 'application/json' })
+            res.end(JSON.stringify(Object.values(PROFILES).map(p => ({
+              id: p.id,
+              name: p.name,
+              short: p.short,
+              patterns: p.patterns,
+              prompt: loadPromptSync(p, 'pentagi'),
+            }))))
+            return
+          }
+          if (sub === 'logs') {
+            res.writeHead(200, { 'Content-Type': 'application/json' })
+            res.end(JSON.stringify({ logs: taskLogs, isRunning }))
+            return
+          }
+          if (sub === 'models') {
+            const snap = await snapshotHarnessLlms()
+            res.writeHead(200, { 'Content-Type': 'application/json' })
+            res.end(JSON.stringify({ ...await probePentagi(), harness: snap }))
+            return
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify(await probePentagi()))
           return
         }
         res.writeHead(404)
@@ -615,71 +769,236 @@ export function apply(ctx) {
           const sub = segments[3] ?? 'status'
           if (sub === 'install' || sub === 'extras') {
             if (isRunning) {
-              res.writeHead(409, { 'Content-Type': 'application/json' })
-              res.end(JSON.stringify({ error: 'Task already running', ...installStatusPayload() }))
+              res.writeHead(409)
+              res.end('Task already running')
               return
             }
+            isRunning = true
+            taskLogs = []
             let raw = ''
-            for await (const chunk of req) raw += chunk
-            let payload = {}
-            try { payload = JSON.parse(raw) } catch { /* empty */ }
-            const which = payload.extra === 'angr' ? 'angr' : 'full'
-            isRunning = true
-            taskLogs = []
-            installJob = { extra: which, error: null, result: null, live: '' }
-            appendTaskLog(which === 'angr' ? '开始加装调用图引擎…' : '开始安装高精度引擎…')
-            appendTaskLog('下载可能要几分钟，日志会持续刷出来。')
-            void installReverifyExtras(which, appendTaskLog)
-              .then((status) => {
-                installJob.result = status
-                appendTaskLog(which === 'angr' ? '调用图引擎已装好' : '高精度引擎已装好')
+            try {
+              for await (const chunk of req) raw += chunk
+              let payload = {}
+              try { payload = JSON.parse(raw) } catch { /* empty */ }
+              const which = payload.extra === 'angr' ? 'angr' : 'full'
+              taskLogs.push(`install reverify extras: ${which}`)
+              const status = await installReverifyExtras(which, (line) => {
+                taskLogs.push(line)
+                if (taskLogs.length > 400) taskLogs = taskLogs.slice(-300)
               })
-              .catch((error) => {
-                const message = String(error?.message ?? error)
-                installJob.error = message
-                appendTaskLog(message)
-              })
-              .finally(() => {
-                isRunning = false
-              })
-            res.writeHead(202, { 'Content-Type': 'application/json' })
-            res.end(JSON.stringify({ started: true, ...installStatusPayload() }))
-            return
-          }
-          if (sub === 'uninstall') {
-            if (isRunning) {
-              res.writeHead(409, { 'Content-Type': 'application/json' })
-              res.end(JSON.stringify({ error: 'Task already running', ...installStatusPayload() }))
-              return
+              res.writeHead(200, { 'Content-Type': 'application/json' })
+              res.end(JSON.stringify({ ...status, logs: taskLogs }))
+            } catch (error) {
+              taskLogs.push(String(error?.message ?? error))
+              res.writeHead(500, { 'Content-Type': 'application/json' })
+              res.end(JSON.stringify({ error: String(error?.message ?? error), logs: taskLogs }))
+            } finally {
+              isRunning = false
             }
-            isRunning = true
-            taskLogs = []
-            installJob = { extra: 'uninstall', error: null, result: null, live: '' }
-            appendTaskLog('开始卸载可选引擎…')
-            void uninstallReverifyExtras(appendTaskLog)
-              .then((status) => {
-                installJob.result = status
-                appendTaskLog('可选引擎已卸掉')
-              })
-              .catch((error) => {
-                const message = String(error?.message ?? error)
-                installJob.error = message
-                appendTaskLog(message)
-              })
-              .finally(() => {
-                isRunning = false
-              })
-            res.writeHead(202, { 'Content-Type': 'application/json' })
-            res.end(JSON.stringify({ started: true, ...installStatusPayload() }))
             return
           }
           if (sub === 'logs') {
             res.writeHead(200, { 'Content-Type': 'application/json' })
-            res.end(JSON.stringify(installStatusPayload()))
+            res.end(JSON.stringify({ logs: taskLogs, isRunning }))
             return
           }
           res.writeHead(200, { 'Content-Type': 'application/json' })
           res.end(JSON.stringify(await probeReverify()))
+          return
+        }
+        if (action === 'pentagi') {
+          const sub = segments[3] ?? 'status'
+          if (sub === 'start' || sub === 'stop') {
+            if (isRunning) {
+              res.writeHead(409)
+              res.end('Task already running')
+              return
+            }
+            isRunning = true
+            taskLogs = []
+            try {
+              taskLogs.push(sub === 'start' ? 'start pentagi docker compose…' : 'stop pentagi docker compose…')
+              const status = sub === 'start'
+                ? await startPentagiRuntime((line) => {
+                  taskLogs.push(line)
+                  if (taskLogs.length > 400) taskLogs = taskLogs.slice(-300)
+                })
+                : await stopPentagiRuntime((line) => {
+                  taskLogs.push(line)
+                  if (taskLogs.length > 400) taskLogs = taskLogs.slice(-300)
+                })
+              res.writeHead(200, { 'Content-Type': 'application/json' })
+              res.end(JSON.stringify({ ...status, logs: taskLogs }))
+            } catch (error) {
+              taskLogs.push(String(error?.message ?? error))
+              res.writeHead(500, { 'Content-Type': 'application/json' })
+              res.end(JSON.stringify({ error: String(error?.message ?? error), logs: taskLogs }))
+            } finally {
+              isRunning = false
+            }
+            return
+          }
+          if (sub === 'logs') {
+            res.writeHead(200, { 'Content-Type': 'application/json' })
+            res.end(JSON.stringify({ logs: taskLogs, isRunning }))
+            return
+          }
+          if (sub === 'config') {
+            let body = ''
+            for await (const chunk of req) body += chunk
+            let payload = {}
+            try { payload = JSON.parse(body) } catch { /* empty */ }
+            const patch = {}
+            if (payload.port !== undefined) {
+              const port = Number(payload.port)
+              if (!Number.isInteger(port) || port < 1 || port > 65535) {
+                res.writeHead(400, { 'Content-Type': 'application/json' })
+                res.end(JSON.stringify({ error: 'port must be 1-65535' }))
+                return
+              }
+              patch.port = port
+            }
+            if (payload.stopOnExit !== undefined) patch.stopOnExit = payload.stopOnExit === true
+            if (payload.autostart !== undefined) patch.autostart = payload.autostart === true
+            if (payload.sandbox !== undefined) patch.sandbox = payload.sandbox === true
+            if (payload.dind !== undefined) patch.dind = payload.dind === true
+            if (payload.harnessProvider !== undefined) patch.harnessProvider = String(payload.harnessProvider || 'auto')
+            if (payload.embeddingSource !== undefined) {
+              const src = String(payload.embeddingSource || 'none')
+              patch.embeddingSource = (src === 'local' || src === 'api') ? src : 'none'
+            }
+            if (payload.embeddingApiUrl !== undefined) patch.embeddingApiUrl = String(payload.embeddingApiUrl || '').trim()
+            if (payload.embeddingApiModel !== undefined) patch.embeddingApiModel = String(payload.embeddingApiModel || 'text-embedding-3-small').trim()
+            if (payload.embeddingApiKey !== undefined) patch.embeddingApiKey = String(payload.embeddingApiKey || '').trim()
+            const next = savePentagiSettings(patch)
+            if (patch.embeddingSource === 'none') {
+              await stopLocalEmbedder((line) => taskLogs.push(line)).catch(() => {})
+            }
+            try {
+              const dest = pentagiEnvPath()
+              const inspected = await inspectHarnessLlms()
+              const pick = pickHarnessLlm(inspected)
+              if (pick && existsSync(dest)) {
+                const embedding = await resolveEmbeddingForEnv((line) => taskLogs.push(line))
+                const prev = readFileSync(dest, 'utf8')
+                writeFileSync(dest, applyLlmToEnvText(prev, pick, { embedding }))
+              }
+            } catch { /* env rewrite is best-effort; restart backend to apply */ }
+            res.writeHead(200, { 'Content-Type': 'application/json' })
+            res.end(JSON.stringify({ ...await probePentagi(), config: next }))
+            return
+          }
+          if (sub === 'sync-models') {
+            if (isRunning) {
+              res.writeHead(409)
+              res.end('Task already running')
+              return
+            }
+            isRunning = true
+            try {
+              let body = ''
+              for await (const chunk of req) body += chunk
+              let payload = {}
+              try { payload = JSON.parse(body) } catch { /* empty */ }
+              if (payload.harnessProvider) savePentagiSettings({ harnessProvider: String(payload.harnessProvider) })
+              const inspected = await inspectHarnessLlms()
+              const pick = pickHarnessLlm(inspected)
+              if (!pick) {
+                res.writeHead(400, { 'Content-Type': 'application/json' })
+                res.end(JSON.stringify({ error: 'Harness 里没有带 API key 的模型' }))
+                return
+              }
+              const dest = pentagiEnvPath()
+              const prev = existsSync(dest) ? readFileSync(dest, 'utf8') : ''
+              const embedding = await resolveEmbeddingForEnv((line) => taskLogs.push(line))
+              writeFileSync(dest, applyLlmToEnvText(prev, pick, { embedding }))
+              const synced = await syncGraphqlProviders(pick, inspected)
+              res.writeHead(200, { 'Content-Type': 'application/json' })
+              res.end(JSON.stringify({
+                ...await probePentagi(),
+                harness: await snapshotHarnessLlms(),
+                synced,
+                note: '已写入 .env 与 GraphQL。若容器还在用旧 LLM_SERVER_*，点一次「重新启动后端」。',
+              }))
+            } catch (error) {
+              res.writeHead(500, { 'Content-Type': 'application/json' })
+              res.end(JSON.stringify({ error: String(error?.message ?? error) }))
+            } finally {
+              isRunning = false
+            }
+            return
+          }
+          if (sub === 'docker-install') {
+            if (isRunning) {
+              res.writeHead(409)
+              res.end('Task already running')
+              return
+            }
+            isRunning = true
+            taskLogs = ['检查本机 Docker / 架构并安装依赖…']
+            try {
+              const result = await installDockerStack((line) => {
+                taskLogs.push(line)
+                if (taskLogs.length > 400) taskLogs = taskLogs.slice(-300)
+              }, process.env, { pullImages: true })
+              res.writeHead(result.ok ? 200 : 500, { 'Content-Type': 'application/json' })
+              res.end(JSON.stringify({ ...await probePentagi(), ...result, logs: taskLogs, error: result.ok ? undefined : result.error }))
+            } catch (error) {
+              taskLogs.push(String(error?.message ?? error))
+              res.writeHead(500, { 'Content-Type': 'application/json' })
+              res.end(JSON.stringify({ error: String(error?.message ?? error), logs: taskLogs }))
+            } finally {
+              isRunning = false
+            }
+            return
+          }
+          if (sub === 'embedder') {
+            if (isRunning) {
+              res.writeHead(409)
+              res.end('Task already running')
+              return
+            }
+            isRunning = true
+            try {
+              let body = ''
+              for await (const chunk of req) body += chunk
+              let payload = {}
+              try { payload = JSON.parse(body) } catch { /* empty */ }
+              const op = String(payload.op || 'start')
+              if (op === 'stop') {
+                const stopped = await stopLocalEmbedder((line) => taskLogs.push(line))
+                const dest = pentagiEnvPath()
+                const inspected = await inspectHarnessLlms()
+                const pick = pickHarnessLlm(inspected)
+                if (pick && existsSync(dest)) {
+                  writeFileSync(dest, applyLlmToEnvText(readFileSync(dest, 'utf8'), pick, { embedding: { ok: false, source: 'local' } }))
+                }
+                res.writeHead(200, { 'Content-Type': 'application/json' })
+                res.end(JSON.stringify({ ...await probePentagi(), stopped, logs: taskLogs }))
+                return
+              }
+              savePentagiSettings({ embeddingSource: 'local' })
+              const started = await ensureLocalEmbedder((line) => taskLogs.push(line))
+              const embedding = await resolveEmbeddingForEnv((line) => taskLogs.push(line))
+              const dest = pentagiEnvPath()
+              const inspected = await inspectHarnessLlms()
+              const pick = pickHarnessLlm(inspected)
+              if (pick && existsSync(dest)) {
+                writeFileSync(dest, applyLlmToEnvText(readFileSync(dest, 'utf8'), pick, { embedding }))
+              }
+              const ok = started.ok && embedding.ok
+              res.writeHead(ok ? 200 : 500, { 'Content-Type': 'application/json' })
+              res.end(JSON.stringify({ ...await probePentagi(), started, embedding, logs: taskLogs, error: ok ? undefined : (started.error || embedding.error) }))
+            } catch (error) {
+              res.writeHead(500, { 'Content-Type': 'application/json' })
+              res.end(JSON.stringify({ error: String(error?.message ?? error), logs: taskLogs }))
+            } finally {
+              isRunning = false
+            }
+            return
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify(await probePentagi()))
           return
         }
         if (action === 'default') {
