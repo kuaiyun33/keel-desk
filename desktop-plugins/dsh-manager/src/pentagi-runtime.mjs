@@ -1,13 +1,23 @@
 import { spawn } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, writeFileSync, copyFileSync } from 'node:fs'
+import { createWriteStream, existsSync, mkdirSync, readFileSync, statSync, writeFileSync, copyFileSync } from 'node:fs'
 import https from 'node:https'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { pipeline } from 'node:stream/promises'
 
 const here = dirname(fileURLToPath(import.meta.url))
 
-const EXTRA_PATH = ['/opt/homebrew/bin', '/usr/local/bin', '/Applications/Docker.app/Contents/Resources/bin']
+const EXTRA_PATH = [
+  '/opt/homebrew/bin',
+  '/usr/local/bin',
+  '/Applications/Docker.app/Contents/Resources/bin',
+  'C:\\Program Files\\Docker\\Docker\\resources\\bin',
+  'C:\\Program Files\\Docker\\Docker\\resources',
+  join(process.env.ProgramFiles || 'C:\\Program Files', 'Docker', 'Docker', 'resources', 'bin'),
+  join(process.env.ProgramFiles || 'C:\\Program Files', 'Docker', 'Docker'),
+  join(process.env.LOCALAPPDATA || '', 'Docker', 'resources', 'bin'),
+]
 const DEFAULT_PENTEST_IMAGE = 'vxcontrol/kali-linux'
 const DEFAULT_ADMIN = 'admin@pentagi.com'
 const DEFAULT_PASSWORD = 'admin'
@@ -91,12 +101,18 @@ function spawnEnv(env = process.env) {
 
 function which(bin, env = process.env) {
   const sep = process.platform === 'win32' ? ';' : ':'
+  const names = process.platform === 'win32' && !/\.[A-Za-z0-9]+$/.test(bin)
+    ? [`${bin}.exe`, `${bin}.cmd`, `${bin}.bat`, bin]
+    : [bin]
   const dirs = [...EXTRA_PATH, ...(spawnEnv(env).PATH.split(sep))]
   for (const dir of dirs) {
-    const p = join(dir, bin)
-    if (existsSync(p)) return p
+    if (!dir) continue
+    for (const name of names) {
+      const p = join(dir, name)
+      if (existsSync(p)) return p
+    }
   }
-  return bin
+  return names[0]
 }
 
 function run(command, args, options = {}) {
@@ -321,17 +337,172 @@ function brewBin(env = process.env) {
 }
 
 function dockerDesktopApp() {
+  if (process.platform === 'win32') {
+    const pf = process.env.ProgramFiles || 'C:\\Program Files'
+    const pf86 = process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)'
+    return [
+      join(pf, 'Docker', 'Docker', 'Docker Desktop.exe'),
+      join(pf86, 'Docker', 'Docker', 'Docker Desktop.exe'),
+    ].find(p => existsSync(p)) || join(pf, 'Docker', 'Docker', 'Docker Desktop.exe')
+  }
   return '/Applications/Docker.app'
+}
+
+function dockerDesktopInstalled() {
+  const app = dockerDesktopApp()
+  if (process.platform === 'win32') return existsSync(app)
+  return existsSync(app)
+}
+
+function dockerInstallerUrls() {
+  const arch = hostArch() === 'arm64' ? 'arm64' : 'amd64'
+  return [
+    `https://desktop.docker.com/win/main/${arch}/Docker%20Desktop%20Installer.exe`,
+    `https://desktop.docker.com/win/main/${arch}/Docker Desktop Installer.exe`,
+  ]
+}
+
+function downloadWithHttps(url, dest, onLog) {
+  mkdirSync(dirname(dest), { recursive: true })
+  onLog(`下载 ${url}`)
+  return new Promise((resolvePromise, reject) => {
+    const follow = (current, hops) => {
+      if (hops > 8) {
+        reject(new Error('too many redirects'))
+        return
+      }
+      const req = https.get(current, {
+        headers: { 'User-Agent': 'DeepSeek-Harness-Desktop/1.0.2' },
+      }, (res) => {
+        const loc = res.headers.location
+        if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && loc) {
+          res.resume()
+          follow(new URL(loc, current).href, hops + 1)
+          return
+        }
+        if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) {
+          res.resume()
+          reject(new Error(`HTTP ${res.statusCode}`))
+          return
+        }
+        const out = createWriteStream(dest)
+        pipeline(res, out).then(() => {
+          const size = existsSync(dest) ? statSync(dest).size : 0
+          onLog(`已写入 ${dest} (${(size / 1024 / 1024).toFixed(1)} MiB)`)
+          resolvePromise(dest)
+        }).catch(reject)
+      })
+      req.setTimeout(10 * 60_000, () => {
+        req.destroy(new Error('download timed out'))
+      })
+      req.on('error', reject)
+    }
+    follow(url, 0)
+  })
+}
+
+async function downloadFile(url, dest, onLog) {
+  try {
+    return await downloadWithHttps(url, dest, onLog)
+  } catch (httpsError) {
+    onLog(`https 下载失败（${httpsError?.message ?? httpsError}），改用 curl…`)
+  }
+  const curl = which('curl', process.env)
+  const curlRun = await run(curl, ['-L', '--fail', '--retry', '3', '-A', 'DeepSeek-Harness-Desktop/1.0.2', '-o', dest, url], {
+    timeoutMs: 15 * 60_000,
+    onLog,
+  })
+  if (curlRun.ok && existsSync(dest) && statSync(dest).size > 1024 * 1024) {
+    onLog(`curl 已写入 ${dest}`)
+    return dest
+  }
+  throw new Error(curlRun.stderr || 'https and curl download both failed')
+}
+
+async function installWindowsDockerWithWinget(onLog, env) {
+  const winget = which('winget', env)
+  if (!existsSync(winget)) return { ok: false, error: 'winget not found' }
+  onLog('$ winget install Docker.DockerDesktop')
+  const installed = await run(winget, [
+    'install', '-e', '--id', 'Docker.DockerDesktop',
+    '--accept-package-agreements', '--accept-source-agreements',
+    '--disable-interactivity', '--silent',
+  ], { timeoutMs: 20 * 60_000, env, onLog })
+  if (installed.ok || dockerDesktopInstalled()) return { ok: true, via: 'winget' }
+  return { ok: false, error: installed.stderr || installed.stdout || 'winget install failed' }
+}
+
+async function installWindowsDockerWithChoco(onLog, env) {
+  const choco = which('choco', env)
+  if (!existsSync(choco)) return { ok: false, error: 'choco not found' }
+  onLog('$ choco install docker-desktop -y')
+  const installed = await run(choco, ['install', 'docker-desktop', '-y', '--no-progress'], { timeoutMs: 20 * 60_000, env, onLog })
+  if (installed.ok || dockerDesktopInstalled()) return { ok: true, via: 'choco' }
+  return { ok: false, error: installed.stderr || installed.stdout || 'choco install failed' }
+}
+
+async function installWindowsDockerFromInstaller(onLog, env) {
+  const installer = join(userHome(env), 'pentagi', 'DockerDesktopInstaller.exe')
+  let lastError = 'no installer url'
+  for (const url of dockerInstallerUrls()) {
+    try {
+      await downloadFile(url, installer, onLog)
+      lastError = ''
+      break
+    } catch (error) {
+      lastError = String(error?.message ?? error)
+      onLog(`下载失败：${lastError}`)
+    }
+  }
+  if (lastError || !existsSync(installer) || statSync(installer).size < 1024 * 1024) {
+    return { ok: false, error: `下载 Docker Desktop 失败：${lastError}` }
+  }
+  onLog('正在静默安装 Docker Desktop（需要本机管理员权限，可能弹出 UAC）…')
+  const installed = await run(installer, ['install', '--quiet', '--accept-license'], { timeoutMs: 20 * 60_000, env, onLog })
+  if (installed.ok || dockerDesktopInstalled()) return { ok: true, via: 'installer' }
+  onLog('静默安装失败，改用交互安装…')
+  const interactive = await run(installer, ['install', '--accept-license'], { timeoutMs: 20 * 60_000, env, onLog })
+  if (interactive.ok || dockerDesktopInstalled()) return { ok: true, via: 'installer-ui' }
+  return { ok: false, error: interactive.stderr || installed.stderr || 'Docker Desktop installer failed' }
+}
+
+async function installWindowsDockerDesktop(onLog, env) {
+  const winget = await installWindowsDockerWithWinget(onLog, env)
+  if (winget.ok) return winget
+  onLog(`winget 不可用：${winget.error}`)
+  const choco = await installWindowsDockerWithChoco(onLog, env)
+  if (choco.ok) return choco
+  onLog(`chocolatey 不可用：${choco.error}`)
+  const fromFile = await installWindowsDockerFromInstaller(onLog, env)
+  if (fromFile.ok) return fromFile
+  onLog('自动下载失败，打开 Docker Desktop 官网安装页…')
+  spawn('cmd.exe', ['/c', 'start', '', 'https://www.docker.com/products/docker-desktop/'], {
+    detached: true,
+    stdio: 'ignore',
+    env: spawnEnv(env),
+  }).unref()
+  return {
+    ok: false,
+    error: `${fromFile.error}。已打开官网，装完 Docker Desktop 并等到托盘绿灯后，再点一次「安装 Docker 依赖」。`,
+  }
+}
+
+async function startWindowsDockerDesktop(onLog, env) {
+  const app = dockerDesktopApp()
+  if (!existsSync(app)) return { ok: false, error: 'Docker Desktop.exe not found after install' }
+  onLog(`启动 Docker Desktop：${app}`)
+  spawn(app, [], { detached: true, stdio: 'ignore', env: spawnEnv(env) }).unref()
+  return { ok: true }
 }
 
 export async function probeDockerStack(env = process.env) {
   const docker = which('docker', env)
   const colima = which('colima', env)
   const brew = brewBin(env)
-  const dockerCli = docker !== 'docker' && existsSync(docker)
-  const colimaCli = colima !== 'colima' && existsSync(colima)
-  const brewOk = brew !== 'brew' && existsSync(brew)
-  const desktop = existsSync(dockerDesktopApp())
+  const dockerCli = existsSync(docker)
+  const colimaCli = existsSync(colima)
+  const brewOk = existsSync(brew)
+  const desktop = dockerDesktopInstalled()
   const version = dockerCli ? await run(docker, ['--version'], { timeoutMs: 5_000, env }) : { ok: false }
   const daemon = dockerCli ? await run(docker, ['info'], { timeoutMs: 8_000, env }) : { ok: false }
   const images = {}
@@ -402,6 +573,30 @@ export async function installDockerStack(onLog = () => {}, env = process.env, { 
     const docker = stack.dockerBin
     const images = pullImages ? await pullPentagiImages(docker, onLog, env) : []
     return { ok: true, installed: false, stack: await probeDockerStack(env), images }
+  }
+
+  if (process.platform === 'win32') {
+    if (!stack.dockerDesktop) {
+      const installed = await installWindowsDockerDesktop(onLog, env)
+      if (!installed.ok) return { ...installed, stack: await probeDockerStack(env) }
+    }
+    stack = await probeDockerStack(env)
+    if (!stack.daemon) {
+      const started = await startWindowsDockerDesktop(onLog, env)
+      if (!started.ok) return { ...started, stack: await probeDockerStack(env) }
+    }
+    const docker = which('docker', env)
+    const info = await waitForDocker(docker, env, onLog, 240_000)
+    if (!info.ok) {
+      return {
+        ok: false,
+        error: 'Docker Desktop 已安装/已尝试启动，但引擎还没起来。请在托盘等到 Docker 绿灯后，再点一次「安装 Docker 依赖」。',
+        stack: await probeDockerStack(env),
+      }
+    }
+    onLog('Docker daemon 已通')
+    const images = pullImages ? await pullPentagiImages(docker, onLog, env) : []
+    return { ok: true, installed: true, stack: await probeDockerStack(env), images }
   }
 
   if (process.platform !== 'darwin' && process.platform !== 'linux') {
@@ -653,9 +848,9 @@ export async function probePentagiRuntime(env = process.env) {
     dockerStack: {
       os: process.platform,
       arch: hostArch(),
-      brew: brewBin(env) !== 'brew' && existsSync(brewBin(env)),
-      dockerDesktop: existsSync(dockerDesktopApp()),
-      colima: which('colima', env) !== 'colima' && existsSync(which('colima', env)),
+      brew: existsSync(brewBin(env)),
+      dockerDesktop: dockerDesktopInstalled(),
+      colima: existsSync(which('colima', env)),
     },
     api,
     tokenPresent,

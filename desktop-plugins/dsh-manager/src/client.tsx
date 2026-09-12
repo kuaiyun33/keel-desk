@@ -558,7 +558,9 @@ function describePentagi(status: PentagiStatus | null) {
         ? `未安装 CLI · ${status.dockerStack?.os || ''}/${status.dockerStack?.arch || ''} · 点「安装 Docker 依赖」`
         : daemonOk
           ? status.docker?.version ?? '已就绪'
-          : 'CLI 在，daemon 未开（会尝试 Colima / Docker Desktop）',
+          : (status.dockerStack?.os === 'win32'
+            ? 'CLI 在，引擎未开（会启动 Docker Desktop）'
+            : 'CLI 在，daemon 未开（会尝试 Colima / Docker Desktop）'),
     },
     { name: 'Compose', ok: composeOk, note: composeOk ? 'pentagi 容器在跑' : '未启动' },
     { name: `API :${status.port ?? 8443}`, ok: apiOk, note: apiOk ? `可到达 · ${status.api?.url ?? ''}` : (status.api?.error ?? '未到达') },
@@ -958,7 +960,7 @@ function PentagiSection() {
 
   const installDocker = async () => {
     setBusy(true)
-    setLogs(['检查本机架构并安装 Docker / Colima，随后拉取 PentAGI 镜像…'])
+    setLogs(['检查本机架构并安装 Docker（Windows 装 Docker Desktop，macOS 走 Colima），随后拉取 PentAGI 镜像…'])
     startPolling()
     try {
       const res = await fetch('/api/coldbrew/pentagi/docker-install', { method: 'POST' })
