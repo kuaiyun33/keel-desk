@@ -60,6 +60,13 @@ class RebuildController {
     this.logger = logger;
     this.live = live;
   }
+  ctx;
+  cfg;
+  stores;
+  db;
+  runner;
+  logger;
+  live;
   status = idleStatus();
   chunks = [];
   cancelRequested = false;

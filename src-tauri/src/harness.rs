@@ -287,6 +287,16 @@ fn resolve_runtime(
         return checkout_runtime();
     }
 
+    if let Some(paths) = portable_runtime_next_to_exe() {
+        update_launch(
+            state,
+            LaunchStage::VerifyingRuntime,
+            58,
+            "已找到完整的便携运行时，正在校验启动入口…".into(),
+        );
+        return bundled_runtime(paths.0, paths.1);
+    }
+
     if let Ok(resource_dir) = window.app_handle().path().resource_dir() {
         update_launch(
             state,
@@ -372,6 +382,8 @@ fn bundled_runtime(path: PathBuf, node: PathBuf) -> Result<RuntimePaths, String>
     }
     let root = dunce::canonicalize(&path)
         .map_err(|error| format!("解析便携 Harness 运行时路径失败：{error}"))?;
+    let node = dunce::canonicalize(&node)
+        .map_err(|error| format!("解析便携 Node 运行时路径失败：{error}"))?;
     let bundled_plugins =
         checked_plugins(&root, &root.join("desktop-plugins"), &root.join("plugins"))?;
     Ok(RuntimePaths {
@@ -643,6 +655,14 @@ fn is_source_root(path: &Path) -> bool {
             .join("dist")
             .join("index.html")
             .is_file()
+}
+
+fn portable_runtime_next_to_exe() -> Option<(PathBuf, PathBuf)> {
+    let exe = env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    let root = dir.join("runtime").join("harness");
+    let node = dir.join("runtime").join(NODE_BINARY_NAME);
+    (is_installed_root(&root) && has_content(&node)).then_some((root, node))
 }
 
 fn is_installed_root(path: &Path) -> bool {

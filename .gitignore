@@ -11,6 +11,14 @@ src-tauri/target-link-fix/
 desktop-settings.json
 coldbrew-sessions.json
 =9.2
+.DS_Store
+发布包/
+**/__pycache__/
+*.pyc
+
+# Local PentAGI compose secrets — never commit.
+vendor/pentagi/.env
+vendor/pentagi/.git/
 
 # plugins/ is vendored. Keep source + built lib, drop nested repos and install trees.
 plugins/*/.git/

@@ -16,6 +16,7 @@ class StateStore {
   constructor(file) {
     this.file = file;
   }
+  file;
   // 声明即初始化：forFamily 在 load 完成前也安全（stats 面板可能早于 runner.init 拉取）
   buckets = { chat: defaultState(), work: defaultState() };
   migrated = false;

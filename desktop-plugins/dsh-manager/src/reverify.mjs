@@ -11,8 +11,11 @@ export const REVERIFY_VERSION = '0.9.0'
 export const REVERIFY_COMMIT = 'f80dc1a080de'
 export const REVERIFY_SOURCE = 'https://github.com/2akouwu/reverify'
 
-export const ARMOR_MODES = ['coldbrew', 'reverify']
+export const ARMOR_MODES = ['coldbrew', 'reverify', 'pentagi']
 export const DEFAULT_ARMOR_MODE = 'coldbrew'
+
+export const PENTAGI_VERSION = '1.0.0'
+export const PENTAGI_SOURCE = 'https://github.com/vxcontrol/pentagi'
 
 const TOOL_TIMEOUT_MS = {
   re_semantic: 180_000,
@@ -178,7 +181,7 @@ export function reverifyBridgePath() {
 }
 
 export function normalizeArmorMode(value) {
-  return value === 'reverify' ? 'reverify' : DEFAULT_ARMOR_MODE
+  return value === 'reverify' || value === 'pentagi' ? value : DEFAULT_ARMOR_MODE
 }
 
 function userHome(env = process.env) {
@@ -315,16 +318,13 @@ function runProcess(command, args, options = {}) {
 function lineLogger(onLog) {
   let leftover = ''
   return (chunk) => {
-    leftover += String(chunk).replace(/\r\n/g, '\n')
-    const lines = leftover.split('\n')
-    leftover = lines.pop() ?? ''
-    for (const line of lines) {
-      const parts = line.split('\r')
-      const last = parts[parts.length - 1].trim()
-      if (last) onLog(last, false)
+    leftover += chunk.replaceAll('\r', '\n')
+    const parts = leftover.split('\n')
+    leftover = parts.pop() ?? ''
+    for (const line of parts) {
+      const trimmed = line.trim()
+      if (trimmed) onLog(trimmed)
     }
-    const live = leftover.split('\r').pop()?.trim() ?? ''
-    if (live) onLog(live, true)
   }
 }
 
@@ -546,7 +546,7 @@ const EXTRAS = {
 async function pipInstall(python, packages, onLog, env, extraArgs = []) {
   const pipArgs = [
     ...python.prefix, '-u', '-m', 'pip', 'install', '--upgrade',
-    '--progress-bar', 'on',
+    '--progress-bar', 'off',
     ...extraArgs,
     ...packages,
   ]
@@ -591,18 +591,6 @@ export async function installReverifyExtras(which = 'full', onLog = () => {}, en
     await pipInstall(python, EXTRAS.full, onLog, env)
   }
   onLog(`installed ${which} extras into ${venvDir}`)
-  return probeReverify(env)
-}
-
-export async function uninstallReverifyExtras(onLog = () => {}, env = process.env) {
-  const venvDir = reverifyVenvDir(env)
-  if (!pathExistsSync(venvDir)) {
-    onLog('本机没有可选引擎，不用卸。')
-    return probeReverify(env)
-  }
-  onLog(`正在删除 ${venvDir}`)
-  await rm(venvDir, { recursive: true, force: true })
-  onLog('可选引擎已卸掉。随应用打包的核心还在，拆样本仍能用。')
   return probeReverify(env)
 }
 
