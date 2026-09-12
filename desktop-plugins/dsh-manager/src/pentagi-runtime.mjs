@@ -8,7 +8,14 @@ import { fileURLToPath } from 'node:url'
 
 const here = dirname(fileURLToPath(import.meta.url))
 
-const EXTRA_PATH = ['/opt/homebrew/bin', '/usr/local/bin', '/Applications/Docker.app/Contents/Resources/bin']
+const EXTRA_PATH = [
+  '/opt/homebrew/bin',
+  '/usr/local/bin',
+  '/Applications/Docker.app/Contents/Resources/bin',
+  // Windows: Docker Desktop CLI lives under Program Files.
+  'C:\\Program Files\\Docker\\Docker\\resources\\bin',
+  'C:\\Program Files\\Docker\\Docker\\resources',
+]
 const DEFAULT_PENTEST_IMAGE = 'vxcontrol/kali-linux'
 const DEFAULT_ADMIN = 'admin@pentagi.com'
 const DEFAULT_PASSWORD = 'admin'
@@ -142,9 +149,17 @@ function spawnEnv(env = process.env) {
 function which(bin, env = process.env) {
   const sep = process.platform === 'win32' ? ';' : ':'
   const dirs = [...EXTRA_PATH, ...(spawnEnv(env).PATH.split(sep))]
+  // Windows: bare names resolve through PATHEXT (.exe/.cmd/.bat). Probe both
+  // the bare file and common extensions so spawn never fails on "EINVAL".
+  const exts = process.platform === 'win32'
+    ? ['', '.exe', '.cmd', '.bat', '.ps1']
+    : ['']
   for (const dir of dirs) {
-    const p = join(dir, bin)
-    if (existsSync(p)) return p
+    if (!dir) continue
+    for (const ext of exts) {
+      const p = join(dir, bin + ext)
+      if (existsSync(p)) return p
+    }
   }
   return bin
 }
@@ -370,8 +385,129 @@ function brewBin(env = process.env) {
   return which('brew', env)
 }
 
+/** Docker Desktop 安装路径（macOS / Windows），Windows 版也能被探测到。 */
 function dockerDesktopApp() {
+  if (process.platform === 'win32') return 'C:\\Program Files\\Docker\\Docker\\Docker Desktop.exe'
   return '/Applications/Docker.app'
+}
+
+/** Windows 包管理器：优先 winget，其次 choco。返回可用命令名或 ''。 */
+function windowsPackageManager(env = process.env) {
+  const winget = which('winget', env)
+  if (winget !== 'winget' && existsSync(winget)) return 'winget'
+  const choco = which('choco', env)
+  if (choco !== 'choco' && existsSync(choco)) return 'choco'
+  return ''
+}
+
+async function installWindowsDockerDesktop(onLog, env) {
+  const mgr = windowsPackageManager(env)
+  if (!mgr) {
+    return { ok: false, error: 'Windows 未找到 winget/choco。请先装 Docker Desktop（https://desktop.docker.com/win/main/amd64/Docker%20Desktop%20Installer.exe）再点重试。' }
+  }
+  if (mgr === 'winget') {
+    onLog('$ winget install Docker.DockerDesktop')
+    const r = await run('winget', ['install', '--id', 'Docker.DockerDesktop', '-e', '--silent', '--scope', 'machine', '--accept-source-agreements', '--accept-package-agreements'], { timeoutMs: 20 * 60_000, env, onLog })
+    if (!r.ok) return { ok: false, error: r.stderr || r.stdout || 'winget install failed' }
+  } else {
+    onLog('$ choco install docker-desktop -y')
+    const r = await run('choco', ['install', 'docker-desktop', '-y'], { timeoutMs: 20 * 60_000, env, onLog })
+    if (!r.ok) return { ok: false, error: r.stderr || r.stdout || 'choco install failed' }
+  }
+  return { ok: true }
+}
+
+/** 启动 Docker Desktop：macOS 用 open，Windows 直接起 exe。 */
+async function openDockerDesktop(onLog, env = process.env) {
+  onLog('发现 Docker Desktop，正在打开…')
+  if (process.platform === 'win32') {
+    const exe = join(process.env.ProgramFiles ?? 'C:\\Program Files', 'Docker', 'Docker', 'Docker Desktop.exe')
+    if (existsSync(exe)) return run(exe, [], { timeoutMs: 20_000, env, onLog })
+    return run('cmd', ['/c', 'start', '', '"Docker Desktop"'], { timeoutMs: 20_000, env, onLog })
+  }
+  return run('open', ['-a', 'Docker'], { timeoutMs: 15_000, env, onLog })
+}
+
+/** 用一个最小镜像探 daemon 的 registry 解析是否可用（区分 DNS 死和普通失败）。 */
+async function checkDaemonDns(docker, onLog, env) {
+  onLog('$ docker pull hello-world（探 registry 连通）')
+  const r = await run(docker, ['pull', '--quiet', 'hello-world:latest'], { timeoutMs: 90_000, env, onLog })
+  if (r.ok) {
+    return { ok: true }
+  }
+  const text = `${r.stderr || ''}\n${r.stdout || ''}`
+  // DNS 死的典型指纹：lookup … connection refused / no such host / server misbehaving
+  if (/lookup .* (connection refused|no such host|server misbehaving|i\/o timeout)/i.test(text)) {
+    return { ok: false, dns: true, error: (r.stderr || r.stdout || '').split('\n').pop() }
+  }
+  return { ok: false, dns: false, error: (r.stderr || r.stdout || '').split('\n').pop() || 'pull failed' }
+}
+
+async function writeDaemonJsonDns(onLog, env) {
+  const path = join(homedir(), '.docker', 'daemon.json')
+  let conf = {}
+  try { conf = JSON.parse(readFileSync(path, 'utf8')) } catch { conf = {} }
+  conf.dns = ['8.8.8.8', '1.1.1.1', '223.5.5.5']
+  mkdirSync(dirname(path), { recursive: true })
+  writeFileSync(path, JSON.stringify(conf, null, 2))
+  onLog(`已写 ${path} 的 dns: 8.8.8.8 / 1.1.1.1 / 223.5.5.5`)
+  return path
+}
+
+function colimaYamlPath() {
+  return join(homedir(), '.colima', process.platform === 'win32' ? '_lima' : 'default', 'colima.yaml')
+}
+
+/** Colima VM resolv 断链的自愈：写死公共 DNS + 重启 VM。 */
+async function healColimaDns(onLog, env) {
+  const yaml = join(homedir(), '.colima', 'default', 'colima.yaml')
+  try {
+    if (existsSync(yaml)) {
+      const text = readFileSync(yaml, 'utf8')
+      if (/^\s*dns:\s*null\s*$/m.test(text)) {
+        const next = text.replace(/^\s*dns:\s*null\s*$/m, '  dns:\n    - 8.8.8.8\n    - 1.1.1.1')
+        writeFileSync(yaml, next)
+        onLog('已在 colima.yaml 写入显式 DNS')
+      }
+    }
+  } catch { /* 继续 */ }
+  await writeDaemonJsonDns(onLog, env)
+  const colima = which('colima', env)
+  onLog('$ colima restart（应用 DNS 配置）')
+  const restarted = await run(colima, ['restart'], { timeoutMs: 300_000, env, onLog })
+  if (!restarted.ok) return { ok: false, error: restarted.stderr || 'colima restart failed' }
+  return { ok: true }
+}
+
+/** Docker 宿主 DNS 自愈（跨平台）：daemon 通但 registry 解析死时调用。 */
+async function healDaemonDns(stack, onLog, env) {
+  const colima = which('colima', env)
+  const hasColima = (colima !== 'colima' && existsSync(colima)) || existsSync(join(homedir(), '.colima', 'default', 'colima.yaml'))
+  if (hasColima) {
+    onLog('检测到 Colima：用显式公共 DNS 修复 VM 解析…')
+    const healed = await healColimaDns(onLog, env)
+    if (!healed.ok) return healed
+  } else if (process.platform === 'win32') {
+    // Windows Docker Desktop（WSL2 后端）：杀掉重开 + 写 DNS 常能恢复解析。
+    onLog('重启 Docker Desktop（WSL2 后端）以恢复 DNS…')
+    try { await run('taskkill', ['/IM', 'Docker Desktop.exe', '/F'], { timeoutMs: 20_000, env, onLog }) } catch { /* not running */ }
+    await openDockerDesktop(onLog, env)
+    try { await writeDaemonJsonDns(onLog, env) } catch { /* 忽略 */ }
+  } else if (process.platform === 'darwin') {
+    onLog('重启 Docker Desktop 以恢复 DNS…')
+    try { await run('osascript', ['-e', 'tell application "Docker" to quit'], { timeoutMs: 20_000, env, onLog }) } catch { /* not running */ }
+    await openDockerDesktop(onLog, env)
+    try { await writeDaemonJsonDns(onLog, env) } catch { /* 忽略 */ }
+  } else {
+    return { ok: false, error: 'registry 解析失败。Linux 原生 docker 请在 /etc/docker/daemon.json 加 {"dns":["8.8.8.8","1.1.1.1"]} 后 sudo systemctl restart docker，再重试。' }
+  }
+  const docker = which('docker', env)
+  const verify = await checkDaemonDns(docker, onLog, env)
+  if (verify.ok) {
+    onLog('DNS 已恢复，registry 可达')
+    return { ok: true }
+  }
+  return { ok: false, error: `DNS 自动修复后仍失败：${verify.error}。手动办法：Docker Desktop → Settings → Resources → Network → DNS 固定为 8.8.8.8 后重启。` }
 }
 
 export async function probeDockerStack(env = process.env) {
@@ -450,16 +586,38 @@ export async function installDockerStack(onLog = () => {}, env = process.env, { 
   let stack = await probeDockerStack(env)
   if (stack.ready) {
     onLog('Docker daemon 已就绪')
+    // daemon 虽通，registry 解析可能坏的（Colima VM resolv 断链之类）：
+    // 拉个 13KB hello-world 探一下，不行就自动修 DNS 再继续。
+    const dns = await checkDaemonDns(stack.dockerBin, onLog, env)
+    if (!dns.ok) {
+      const healed = await healDaemonDns(stack, onLog, env)
+      if (!healed.ok) return { ok: false, error: healed.error, stack: await probeDockerStack(env) }
+      stack = await probeDockerStack(env)
+    }
     const docker = stack.dockerBin
     const images = pullImages ? await pullPentagiImages(docker, onLog, env) : []
     return { ok: true, installed: false, stack: await probeDockerStack(env), images }
   }
 
-  if (process.platform !== 'darwin' && process.platform !== 'linux') {
-    return { ok: false, error: `暂不自动安装 ${process.platform} 上的 Docker，请手动安装 Docker Desktop / 引擎。`, stack }
+  if (process.platform !== 'darwin' && process.platform !== 'linux' && process.platform !== 'win32') {
+    return { ok: false, error: `暂不自动安装 ${process.platform} 上的 Docker，请手动安装 Docker / 容器引擎。`, stack }
   }
 
-  if (!stack.dockerCli || !stack.colimaCli) {
+  // Windows：winget/choco 装 Docker Desktop，然后打开并等 daemon。
+  if (process.platform === 'win32') {
+    if (!stack.dockerDesktop && !stack.dockerCli) {
+      const installed = await installWindowsDockerDesktop(onLog, env)
+      if (!installed.ok) return { ...installed, stack }
+      stack = await probeDockerStack(env)
+    }
+    if (!stack.daemon) {
+      await openDockerDesktop(onLog, env)
+      const docker = which('docker', env)
+      const info = await waitForDocker(docker, env, onLog, 240_000)
+      if (!info.ok) return { ok: false, error: info.stderr || 'docker still unreachable', stack: await probeDockerStack(env) }
+      stack = await probeDockerStack(env)
+    }
+  } else if (!stack.dockerCli || !stack.colimaCli) {
     const pkgs = []
     if (!stack.dockerCli) pkgs.push('docker')
     if (!stack.colimaCli && !stack.dockerDesktop) pkgs.push('colima')
@@ -470,9 +628,8 @@ export async function installDockerStack(onLog = () => {}, env = process.env, { 
   }
 
   if (stack.dockerDesktop && !stack.daemon) {
-    onLog('发现 Docker Desktop，正在打开…')
-    await run('open', ['-a', 'Docker'], { timeoutMs: 15_000, env, onLog })
-  } else if (!stack.daemon) {
+    await openDockerDesktop(onLog, env)
+  } else if (!stack.daemon && process.platform !== 'win32') {
     const colima = which('colima', env)
     if (colima === 'colima' || !existsSync(colima)) {
       return { ok: false, error: 'docker CLI 或 colima 仍未找到。请安装 Homebrew 后重试，或安装 Docker Desktop。', stack: await probeDockerStack(env) }
