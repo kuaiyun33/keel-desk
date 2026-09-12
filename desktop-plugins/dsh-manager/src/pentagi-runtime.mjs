@@ -128,7 +128,11 @@ export function pentagiSandboxEnabled(env = process.env) {
 export function pentagiDindEnabled(env = process.env) {
   if (String(env.DSH_PENTAGI_DIND ?? '') === '1') return true
   if (String(env.DSH_PENTAGI_DIND ?? '') === '0') return false
-  return readPentagiSettings(env).dind === true
+  const saved = readPentagiSettings(env).dind
+  if (saved !== undefined) return saved === true
+  // 未显式设置：跟随沙箱开关——开了 Kali 沙箱就默认带 DinD
+  // （vxcontrol/kali-linux 镜像自带 docker CLI，挂 VM sock 即可用）。
+  return pentagiSandboxEnabled(env)
 }
 
 /** Colima/Linux VM 内的 docker.sock。挂进 Kali 才能让容器里的 docker CLI 说话。macOS 转发 sock 对不上。 */

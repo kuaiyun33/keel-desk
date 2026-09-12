@@ -693,7 +693,7 @@ function PentagiCard(props: {
             type="checkbox"
             checked={sandboxOn}
             disabled={props.busy}
-            onChange={(event) => props.onConfig({ sandbox: event.target.checked, ...(event.target.checked ? {} : { dind: false }) })}
+            onChange={(event) => props.onConfig({ sandbox: event.target.checked, dind: event.target.checked ? true : false })}
           />
           <span>启用 Kali 沙箱（pg_terminal 进 vxcontrol/kali-linux）</span>
         </label>
