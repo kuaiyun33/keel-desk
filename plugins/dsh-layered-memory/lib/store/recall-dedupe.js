@@ -10,6 +10,7 @@ class RecallDedupeStore {
     this.file = path.join(dataDir, "recall-dedupe.json");
     this.writeChain = this.init();
   }
+  logger;
   file;
   entries = /* @__PURE__ */ new Map();
   persistFailed = false;

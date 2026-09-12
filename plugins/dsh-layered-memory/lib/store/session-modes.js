@@ -14,6 +14,8 @@ class SessionModeStore {
     this.file = path.join(dataDir, "session-modes.json");
     this.loaded = defaultMode;
   }
+  defaultMode;
+  logger;
   file;
   entries = /* @__PURE__ */ new Map();
   loaded;

@@ -793,7 +793,9 @@ async function publishPlatformBundles() {
 }
 
 async function publishMacReleasePack() {
-  const relDir = "/Volumes/编程工具/发布包";
+  const officialDir = "/Volumes/编程工具/发布包";
+  const fallbackDir = join(desktopRoot, "发布包");
+  const relDir = existsSync("/Volumes/编程工具") ? officialDir : fallbackDir;
   const app = join(bundleRoot, "macos", "DeepSeek Harness.app");
   if (!(await pathExists(app))) {
     throw new Error(`macOS app bundle missing: ${app}`);

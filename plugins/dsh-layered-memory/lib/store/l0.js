@@ -14,6 +14,7 @@ class L0Store {
     this.helper = new EmbedHelper(embed, logger);
     this.logger = logger;
   }
+  db;
   dir;
   legacyDir;
   helper;

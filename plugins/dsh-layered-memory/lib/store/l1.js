@@ -17,6 +17,8 @@ class L1Store {
     this.logger = logger;
     this.decayHalfLifeDays = decayHalfLifeDays ?? 30;
   }
+  db;
+  strategy;
   recordsDir;
   legacyFile;
   helper;
