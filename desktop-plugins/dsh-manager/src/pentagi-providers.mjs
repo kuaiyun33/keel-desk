@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -261,6 +261,8 @@ function agentsFor(model) {
 }
 
 export function writeCustomProviderYaml(dest, model) {
+  // 目录可能不存在（~/.dsh/pentagi/ 只在安装后创建）：fs 不会自动建父目录，先补上。
+  mkdirSync(dirname(dest), { recursive: true })
   const block = (name, extra = '') => `${name}:\n  model: "${model}"\n  n: 1\n${extra}`
   const text = [
     block('simple'),
