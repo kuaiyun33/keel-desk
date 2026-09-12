@@ -65,6 +65,19 @@ async function pickRandomPort() {
   return 22443
 }
 
+/** 查 docker 里是否已有名字带 pentagi 的容器，且对外端口映射了给定端口（= 端口被“自己”占用）。 */
+async function pentagiContainerOwnsPort(port, env = process.env) {
+  if (!port) return false
+  const docker = which('docker', env)
+  const probe = await run(docker, ['ps', '--format', '{{.Names}}|{{.Ports}}'], { timeoutMs: 8_000, env }).catch(() => null)
+  if (!probe || !probe.ok) return false
+  return probe.stdout.split('\n').some(line => {
+    const [name, ports] = line.split('|')
+    if (!/pentagi/i.test(name ?? '')) return false
+    return (ports ?? '').includes(`:${port}->`)
+  })
+}
+
 /**
  * 启动前调用一次：确保「对外监听端口」已确定并落盘。
  * 8443 太容易被其他程序占用，首次使用（或已保存端口被占）时在
@@ -79,7 +92,10 @@ export async function ensureRandomListenPort(env = process.env, onLog = () => {}
   const saved = Number(readPentagiSettings(env).port)
   if (saved >= 1 && saved <= 65535) {
     if (await portFree(saved)) return saved
-    onLog(`端口 ${saved} 已被占用，换一个随机空闲端口…`)
+    // 端口被占：先看是不是自己之前起的 pentagi 容器在听——是的话绝不换端口
+    //（否则每次 start 都会把端口搬到新随机值，容器反复重建、API 永远等超时）。
+    if (await pentagiContainerOwnsPort(saved, env)) return saved
+    onLog(`端口 ${saved} 已被其他程序占用，换一个随机空闲端口…`)
     const next = await pickRandomPort()
     savePentagiSettings({ port: next }, env)
     return next
@@ -173,7 +189,9 @@ function run(command, args, options = {}) {
     let settled = false
     const child = spawn(command, args, {
       cwd: options.cwd,
-      env: spawnEnv(options.env ?? process.env),
+      // 调用方显式传 env（如 composeEnv 已按需删掉 DOCKER_HOST）时直接透传；
+      // 只有没传 env 的普通调用才做一次 PATH 扩展 + DOCKER_HOST 注入。
+      env: options.env === undefined ? spawnEnv(process.env) : options.env,
       shell: false,
     })
     const timer = setTimeout(() => {
@@ -367,12 +385,56 @@ export function writePentagiEnvText(text, env = process.env) {
 
 function composeEnv(env = process.env) {
   const next = spawnEnv(env)
-  // Host CLI still talks to colima via docker context; the *container*
-  // must see the in-VM socket. Compose interpolates DOCKER_HOST into the
-  // pentagi service — never leak the macOS path.
-  next.DOCKER_HOST = 'unix:///var/run/docker.sock'
+  // composeEnv 用于宿主 docker-compose 上下文（start/stop/ps）：
+  // 绝不能让宿主路径 DOCKER_HOST 渗进 compose 插值——宿主路径只存在于
+  // 宿主机器，pentagi 容器看到它只会连死（connect: no such file）。
+  // 删掉 env 里的 DOCKER_HOST 后 compose 进程走默认 context（如 colima），
+  // .env 里的 DOCKER_HOST=unix:///var/run/docker.sock（ensureEnvFile）
+  // 仅传进 compose 文件，被挂载到 bind-mount /var/run/docker.sock 的容器使用。
+  delete next.DOCKER_HOST
   next.PENTAGI_DOCKER_SOCKET = '/var/run/docker.sock'
   return next
+}
+
+let composeMode = 'unknown' // unknown | docker | legacy | missing（进程内缓存探测结果）
+
+/**
+ * 探测本机可用的 compose 形态：
+ *  - 'docker'：`docker compose` 子命令可用（Docker Desktop / 新版 CLI 自带插件）；
+ *  - 'legacy'：独立 `docker-compose` v2 二进制可用（brew 安装）；
+ *  - 'missing'：都不可用。
+ */
+async function composeAvailable(docker, env) {
+  if (composeMode !== 'unknown') return composeMode
+  const probe = await run(docker, ['compose', 'version'], { timeoutMs: 8_000, env })
+  if (probe.ok) {
+    composeMode = 'docker'
+    return composeMode
+  }
+  const legacy = which('docker-compose', env)
+  composeMode = (legacy !== 'docker-compose' && existsSync(legacy)) ? 'legacy' : 'missing'
+  return composeMode
+}
+
+/**
+ * 统一 compose 执行：优先 `docker compose <args>`，退回 legacy `docker-compose <args>`。
+ * 缺插件时返回明确报错（而不是把 `-d` 喂给裸 docker 产生 confusing 的 flag 错误）。
+ */
+async function runCompose(docker, cmdArgs, { env, cwd, timeoutMs, onLog } = {}) {
+  const current = process.env ?? {}
+  const e = env ?? current
+  const mode = await composeAvailable(docker, e)
+  if (mode === 'docker') {
+    return run(docker, ['compose', ...cmdArgs], { cwd, env: e, timeoutMs, onLog })
+  }
+  if (mode === 'legacy') {
+    const legacy = which('docker-compose', e)
+    return run(legacy, cmdArgs, { cwd, env: e, timeoutMs, onLog })
+  }
+  return {
+    ok: false,
+    stderr: 'docker compose 插件不可用：macOS 装 Homebrew docker-compose（brew install docker-compose）或 Docker Desktop；Windows 用 Docker Desktop；Linux 装 docker-compose-plugin。然后重试。',
+  }
 }
 
 export function hostArch() {
@@ -823,7 +885,7 @@ export async function probePentagiRuntime(env = process.env) {
   const tokenPresent = Boolean(cfg.token)
   let compose = { ok: false }
   if (daemon.ok && existsSync(join(root, 'docker-compose.yml'))) {
-    const ps = await run(dockerBin, ['compose', 'ps', '--format', 'json'], { cwd: root, timeoutMs: 15_000, env })
+    const ps = await runCompose(dockerBin, ['ps', '--format', 'json'], { cwd: root, timeoutMs: 15_000, env })
     compose = { ok: ps.ok, running: /pentagi/.test(ps.stdout), raw: ps.stdout.slice(0, 500) }
   }
   const image = pentestImage(env)
@@ -1098,7 +1160,7 @@ export async function startPentagiRuntime(onLog = () => {}, env = process.env) {
   let up = { ok: false, stderr: '', stdout: '' }
   for (let attempt = 1; attempt <= 4; attempt++) {
     onLog(`$ docker compose up -d  (${root})  attempt ${attempt}/4`)
-    up = await run(dockerReady.docker, ['compose', 'up', '-d'], { cwd: root, timeoutMs: 15 * 60_000, env: composeEnv(env), onLog })
+    up = await runCompose(dockerReady.docker, ['up', '-d'], { cwd: root, timeoutMs: 15 * 60_000, env: composeEnv(env), onLog })
     if (up.ok) break
     onLog(`compose 失败，20s 后重试：${(up.stderr || up.stdout || '').split('\n').pop()}`)
     await new Promise(r => setTimeout(r, 20_000))
@@ -1134,7 +1196,7 @@ export async function stopPentagiRuntime(onLog = () => {}, env = process.env) {
   const root = pentagiRoot(env)
   if (!existsSync(join(root, 'docker-compose.yml'))) throw new Error(`pentagi root missing: ${root}`)
   onLog(`$ docker compose down  (${root})`)
-  const down = await run(docker, ['compose', 'down'], { cwd: root, timeoutMs: 180_000, env: composeEnv(env), onLog })
+  const down = await runCompose(docker, ['down'], { cwd: root, timeoutMs: 180_000, env: composeEnv(env), onLog })
   if (!down.ok) throw new Error(down.stderr || 'docker compose down failed')
   return probePentagiRuntime(env)
 }
