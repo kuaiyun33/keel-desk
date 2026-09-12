@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process'
+import { createConnection } from 'node:net'
 import { existsSync, mkdirSync, readFileSync, writeFileSync, copyFileSync } from 'node:fs'
 import https from 'node:https'
 import { homedir } from 'node:os'
@@ -13,6 +14,8 @@ const DEFAULT_ADMIN = 'admin@pentagi.com'
 const DEFAULT_PASSWORD = 'admin'
 const LOCAL_PASSWORD = 'DshPentagi1!'
 const DEFAULT_PORT = 8443
+const RANDOM_PORT_MIN = 18000
+const RANDOM_PORT_MAX = 29999
 const LOCAL_EMBED_PORT = 63229
 const LOCAL_EMBED_MODEL = 'BAAI/bge-small-en-v1.5'
 
@@ -25,12 +28,59 @@ function readPentagiSettings(env = process.env) {
   }
 }
 
+/** 同步读：环境变量 → 已保存设置 → 默认 8443。异步路径先用 ensureRandomListenPort 落盘。 */
 export function pentagiListenPort(env = process.env) {
   const fromEnv = Number(env.PENTAGI_LISTEN_PORT || env.DSH_PENTAGI_PORT)
   if (fromEnv >= 1 && fromEnv <= 65535) return fromEnv
   const saved = Number(readPentagiSettings(env).port)
   if (saved >= 1 && saved <= 65535) return saved
   return DEFAULT_PORT
+}
+
+/** 探测某个 TCP 端口当前是否空闲（IPv4 回环，1s 超时）。 */
+async function portFree(port) {
+  return new Promise(resolve => {
+    const net = createConnection({ host: '127.0.0.1', port, timeout: 900 })
+    const done = ok => { net.destroy(); resolve(ok) }
+    net.once('connect', () => done(false))
+    net.once('timeout', () => done(true))
+    net.once('error', () => done(true))
+  })
+}
+
+async function pickRandomPort() {
+  const span = RANDOM_PORT_MAX - RANDOM_PORT_MIN + 1
+  const tries = Math.min(span, 40)
+  for (let i = 0; i < tries; i++) {
+    const candidate = RANDOM_PORT_MIN + Math.floor(Math.random() * span)
+    if (await portFree(candidate)) return candidate
+  }
+  return 22443
+}
+
+/**
+ * 启动前调用一次：确保「对外监听端口」已确定并落盘。
+ * 8443 太容易被其他程序占用，首次使用（或已保存端口被占）时在
+ * 18000-29999 随机挑一个空闲端口写回设置，后续稳定复用。
+ */
+export async function ensureRandomListenPort(env = process.env, onLog = () => {}) {
+  const fromEnv = Number(env.PENTAGI_LISTEN_PORT || env.DSH_PENTAGI_PORT)
+  if (fromEnv >= 1 && fromEnv <= 65535) {
+    if (readPentagiSettings(env).port !== fromEnv) savePentagiSettings({ port: fromEnv }, env)
+    return fromEnv
+  }
+  const saved = Number(readPentagiSettings(env).port)
+  if (saved >= 1 && saved <= 65535) {
+    if (await portFree(saved)) return saved
+    onLog(`端口 ${saved} 已被占用，换一个随机空闲端口…`)
+    const next = await pickRandomPort()
+    savePentagiSettings({ port: next }, env)
+    return next
+  }
+  onLog('分配 PentAGI 对外端口（18000-29999 随机空闲端口，避开常用 8443）…')
+  const picked = await pickRandomPort()
+  savePentagiSettings({ port: picked }, env)
+  return picked
 }
 
 export function pentagiApiUrl(env = process.env) {
@@ -395,6 +445,7 @@ async function pullPentagiImages(docker, onLog, env) {
 }
 
 export async function installDockerStack(onLog = () => {}, env = process.env, { pullImages = true } = {}) {
+  await ensureRandomListenPort(env, onLog)
   onLog(`本机 ${process.platform}/${hostArch()}，开始检查 Docker…`)
   let stack = await probeDockerStack(env)
   if (stack.ready) {
@@ -852,6 +903,8 @@ export function savePentagiSettings(patch = {}, env = process.env) {
 }
 
 export async function startPentagiRuntime(onLog = () => {}, env = process.env) {
+  // 启动前先把对外端口选好并落盘（随机空闲端口，避开 8443），compose 与 probe 都读同一个。
+  await ensureRandomListenPort(env, onLog)
   const dockerReady = await ensureDocker(onLog, env)
   if (!dockerReady.ok) throw new Error(dockerReady.error || 'docker daemon not running')
   let root = pentagiRoot(env)

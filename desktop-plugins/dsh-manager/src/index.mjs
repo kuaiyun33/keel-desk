@@ -929,27 +929,30 @@ export function apply(ctx) {
             return
           }
           if (sub === 'docker-install') {
+            // 长耗时任务（brew 装 Colima + 拉镜像可能 10+ 分钟），不能阻塞 HTTP：
+            // 立即返回 202，前端用 /pentagi/logs 轮询 `isRunning` 与增量日志。
             if (isRunning) {
               res.writeHead(409)
-              res.end('Task already running')
+              res.end(JSON.stringify({ error: 'Task already running', logs: taskLogs, isRunning: true }))
               return
             }
             isRunning = true
             taskLogs = ['检查本机 Docker / 架构并安装依赖…']
-            try {
-              const result = await installDockerStack((line) => {
-                taskLogs.push(line)
-                if (taskLogs.length > 400) taskLogs = taskLogs.slice(-300)
-              }, process.env, { pullImages: true })
-              res.writeHead(result.ok ? 200 : 500, { 'Content-Type': 'application/json' })
-              res.end(JSON.stringify({ ...await probePentagi(), ...result, logs: taskLogs, error: result.ok ? undefined : result.error }))
-            } catch (error) {
-              taskLogs.push(String(error?.message ?? error))
-              res.writeHead(500, { 'Content-Type': 'application/json' })
-              res.end(JSON.stringify({ error: String(error?.message ?? error), logs: taskLogs }))
-            } finally {
-              isRunning = false
-            }
+            void installDockerStack((line) => {
+              taskLogs.push(line)
+              if (taskLogs.length > 400) taskLogs = taskLogs.slice(-300)
+            }, process.env, { pullImages: true })
+              .then((result) => {
+                taskLogs.push(result.ok ? 'Docker 依赖已就绪' : `Docker 安装失败：${result.error ?? 'unknown'}`)
+              })
+              .catch((error) => {
+                taskLogs.push(String(error?.message ?? error))
+              })
+              .finally(() => {
+                isRunning = false
+              })
+            res.writeHead(202, { 'Content-Type': 'application/json' })
+            res.end(JSON.stringify({ started: true, logs: taskLogs, isRunning: true }))
             return
           }
           if (sub === 'embedder') {

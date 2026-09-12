@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react'
 import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
-import { Button, IconCopyOutline16, StateDot, TerminalBlock, Toast } from '@deepseek-ai/dsh-client-ui-primitives'
+import { Button, IconCopyOutline16, Modal, StateDot, TerminalBlock, Toast } from '@deepseek-ai/dsh-client-ui-primitives'
 import styles from './client.css'
 
 const NS = 'desktop-manager'
@@ -844,14 +844,31 @@ function PentagiSection() {
   const [logs, setLogs] = useState<string[]>([])
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState(false)
+  const [logModal, setLogModal] = useState(false)
   const { toast, setToast, showToast } = useToast()
   const pollTimer = useRef<any>(null)
-
+  // 后端任务状态：true = docker-install 后台任务仍在跑，fetchLogs 收尾用。
+  const taskRunningRef = useRef(false)
+  const refreshRef = useRef<() => Promise<void>>(async () => {})
   const fetchLogs = useCallback(async () => {
     try {
       const res = await fetch('/api/coldbrew/pentagi/logs')
       const data = await res.json().catch(() => ({ logs: [] }))
       if (Array.isArray(data.logs) && data.logs.length > 0) setLogs(data.logs)
+      // docker-install 是异步任务（202 立即返回）：这里只反映后端锁，
+      // 任务结束后自动收尾（清 busy、关模态框、刷新状态）。
+      if (typeof data.isRunning === 'boolean') {
+        if (data.isRunning) {
+          taskRunningRef.current = true
+          setBusy(true)
+          setLogModal(true)
+        } else if (taskRunningRef.current) {
+          taskRunningRef.current = false
+          setBusy(false)
+          setLogModal(false)
+          void refreshRef.current()
+        }
+      }
     } catch (error) {
       console.error('Failed to fetch pentagi logs', error)
     }
@@ -881,6 +898,7 @@ function PentagiSection() {
       setLoading(false)
     }
   }, [])
+  refreshRef.current = refresh
 
   useEffect(() => {
     refresh()
@@ -935,6 +953,7 @@ function PentagiSection() {
 
   const startPentagi = async () => {
     setBusy(true)
+    setLogModal(true)
     setLogs(['启动 PentAGI 官方后端…'])
     startPolling()
     try {
@@ -945,42 +964,55 @@ function PentagiSection() {
       setPentagi(data)
       showToast('PentAGI 官方后端已启动')
     } catch (error: any) {
+      setLogs(prev => [...prev, `Error: ${error.message}`])
       showToast(`启动失败: ${error.message}`)
     } finally {
-      if (pollTimer.current) {
-        clearInterval(pollTimer.current)
-        pollTimer.current = null
-      }
+      if (pollTimer.current) { clearInterval(pollTimer.current); pollTimer.current = null }
       setBusy(false)
+      setLogModal(false)
       await refresh()
     }
   }
 
   const installDocker = async () => {
     setBusy(true)
+    setLogModal(true)
+    taskRunningRef.current = true
     setLogs(['检查本机架构并安装 Docker / Colima，随后拉取 PentAGI 镜像…'])
     startPolling()
     try {
       const res = await fetch('/api/coldbrew/pentagi/docker-install', { method: 'POST' })
       const data = await res.json().catch(() => ({}))
       if (Array.isArray(data.logs) && data.logs.length > 0) setLogs(data.logs)
+      // 202 = 已转入后台异步任务，本函数不再等待；前端持续轮询 /logs，
+      // 由 fetchLogs 在 isRunning=false 时收尾（清 busy、关模态框、刷新）。
+      if (res.status === 202) {
+        showToast('Docker 安装已在后台开始，进度见弹窗')
+        return
+      }
       if (!res.ok) throw new Error(data.error ?? 'Docker 安装失败')
       setPentagi(data)
       showToast('Docker 依赖已就绪，可以启动 PentAGI 后端')
     } catch (error: any) {
+      setLogs(prev => [...prev, `Error: ${error.message}`])
       showToast(`Docker 安装失败: ${error.message}`)
     } finally {
-      if (pollTimer.current) {
+      // 同步完成（旧路径）时收尾；202 异步路径由轮询收尾，这里只停计时器。
+      if (pollTimer.current && !taskRunningRef.current) {
         clearInterval(pollTimer.current)
         pollTimer.current = null
       }
-      setBusy(false)
+      if (!taskRunningRef.current) {
+        setBusy(false)
+        setLogModal(false)
+      }
       await refresh()
     }
   }
 
   const runEmbedder = async (op: 'start' | 'stop') => {
     setBusy(true)
+    setLogModal(true)
     setLogs([op === 'start' ? '安装/启动本机向量（第一次会 pip + 下载模型）…' : '停止本机向量服务…'])
     startPolling()
     try {
@@ -996,19 +1028,19 @@ function PentagiSection() {
       showToast(op === 'start' ? '本机向量已启动（约 0.5GB）' : '本机向量已停止')
       if (op === 'start' && data.started?.installed) showToast('fastembed 已安装，模型已就绪')
     } catch (error: any) {
+      setLogs(prev => [...prev, `Error: ${error.message}`])
       showToast(`向量服务失败: ${error.message}`)
     } finally {
-      if (pollTimer.current) {
-        clearInterval(pollTimer.current)
-        pollTimer.current = null
-      }
+      if (pollTimer.current) { clearInterval(pollTimer.current); pollTimer.current = null }
       setBusy(false)
+      setLogModal(false)
       await refresh()
     }
   }
 
   const stopPentagi = async () => {
     setBusy(true)
+    setLogModal(true)
     setLogs(['停止 PentAGI 官方后端…'])
     startPolling()
     try {
@@ -1019,13 +1051,12 @@ function PentagiSection() {
       setPentagi(data)
       showToast('PentAGI 官方后端已停止')
     } catch (error: any) {
+      setLogs(prev => [...prev, `Error: ${error.message}`])
       showToast(`停止失败: ${error.message}`)
     } finally {
-      if (pollTimer.current) {
-        clearInterval(pollTimer.current)
-        pollTimer.current = null
-      }
+      if (pollTimer.current) { clearInterval(pollTimer.current); pollTimer.current = null }
       setBusy(false)
+      setLogModal(false)
       await refresh()
     }
   }
@@ -1054,20 +1085,30 @@ function PentagiSection() {
           onInstallDocker={() => { void installDocker() }}
         />
       </div>
-      {(busy || logs.length > 0) && (
-        <section className="dsm-logs">
-          <div className="dsm-logs-head">
-            <span>任务实时日志</span>
-            {busy && <span className="dsm-logs-running">正在执行…</span>}
-          </div>
-          <TerminalBlock
-            className="dsm-terminal"
-            command="PentAGI 后端"
-            output={logs.length > 0 ? logs.join('\n') : '等待任务开始…'}
-            running={busy}
-          />
-        </section>
-      )}
+      <Modal
+        open={logModal}
+        onClose={() => setLogModal(false)}
+        title="PentAGI 任务日志"
+        closeLabel="关闭日志"
+        description={busy ? '后台执行中，进度实时追加。关闭弹窗不会中断任务。' : '任务已结束（关闭弹窗不会影响服务）。'}
+        footer={(
+          <Button
+            type="button"
+            size="sm"
+            variant={busy ? 'secondary' : 'primary'}
+            onClick={() => setLogModal(false)}
+          >
+            {busy ? '后台继续，关闭弹窗' : '关闭'}
+          </Button>
+        )}
+      >
+        <TerminalBlock
+          className="dsm-terminal"
+          command="PentAGI 后端"
+          output={logs.length > 0 ? logs.join('\n') : '等待任务开始…'}
+          running={busy}
+        />
+      </Modal>
     </div>
   )
 }
