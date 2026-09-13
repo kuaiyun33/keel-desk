@@ -18,6 +18,16 @@ const NS = 'dsh-quick-commands'
 const CLIENT_BUNDLE_ID = 'dsh-quick-commands'
 const ROUTE_PREFIX = '/dsh-quick-commands'
 
+// The Harness platform owns "/". Its slash pipeline
+// (@deepseek-ai/dsh-client-ui-input-trigger) only ever binds
+// TriggerChar '/' | '@', and the built-in 命令 palette (compact / export /
+// feedback / goal …) opens on any trimmed "/"-leading draft. An inline filter of
+// our own therefore fights the platform for the same keystroke and the same
+// screen space — both overlays render at z-index 1200, so ours covered the
+// palette. The inline "/" filter is consequently OFF: the composer button is the
+// only entry point. Flip to true only if the platform trigger moves off "/".
+const SLASH_FILTER_ENABLED = false
+
 // ---- i18n -------------------------------------------------------------------
 
 const zh = {
@@ -566,7 +576,11 @@ function QuickCommands({ input, inputActions, useInput, t: injected }: ClientPro
   }, [open])
 
   // ---- slash: "/" at the start of the draft opens an inline filter ----------
-  const slashQuery = !open && draft.startsWith('/') && !draft.includes('\n') ? draft.slice(1) : null
+  // Disabled by default (see SLASH_FILTER_ENABLED): "/" belongs to the platform
+  // command palette, and this overlay would cover it.
+  const slashQuery = SLASH_FILTER_ENABLED && !open && draft.startsWith('/') && !draft.includes('\n')
+    ? draft.slice(1)
+    : null
   const [dismissedSlash, setDismissedSlash] = useState<string | null>(null)
   const [slashActive, setSlashActive] = useState(0)
   const slashMatches = useMemo(

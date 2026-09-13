@@ -2,14 +2,18 @@
 """OpenAI-compatible /v1/embeddings for PentAGI pgvector (local fastembed)."""
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 MODEL = os.environ.get("DSH_EMBED_MODEL", "BAAI/bge-small-en-v1.5")
-BIND = os.environ.get("DSH_EMBED_BIND", "127.0.0.1")
+# 容器要经 vmnet 接口取向量，所以默认绑所有接口；鉴权由 DSH_EMBED_KEY 承担，
+# 否则等于把本机 embedding 端点裸露给整个局域网。
+BIND = os.environ.get("DSH_EMBED_BIND", "0.0.0.0")
 PORT = int(os.environ.get("DSH_EMBED_PORT", "63229"))
+KEY = os.environ.get("DSH_EMBED_KEY", "")
 
 _model = None
 
@@ -57,9 +61,20 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._send(404, {"error": {"message": "not found", "type": "invalid_request"}})
 
+    def _authorized(self) -> bool:
+        """绑 0.0.0.0 后必须鉴权，否则本机 embedding 端点对局域网敞开。"""
+        if not KEY:
+            return True
+        header = self.headers.get("Authorization") or ""
+        token = header[7:].strip() if header.lower().startswith("bearer ") else ""
+        return hmac.compare_digest(token, KEY)
+
     def do_POST(self):
         if self.path.rstrip("/") not in ("/v1/embeddings", "/embeddings"):
             self._send(404, {"error": {"message": "not found", "type": "invalid_request"}})
+            return
+        if not self._authorized():
+            self._send(401, {"error": {"message": "invalid api key", "type": "invalid_request"}})
             return
         length = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(length) if length else b"{}"

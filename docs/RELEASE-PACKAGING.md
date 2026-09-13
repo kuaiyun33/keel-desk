@@ -12,12 +12,13 @@
 ## 0. 给未来 Agent 的铁律（先读这条）
 
 1. **所有打包产物必须放进 `/Volumes/编程工具/发布包/`**，不要留在 `src-tauri/target/` 或 `dist/` 就算完事。
-2. 命名规范：`DeepSeek-Harness-Desktop-<版本>-macos-<arch>.<dmg|app.zip>`，每个产物**都要附一个同名 `.sha256`**。
+2. **打包之前必须先删除旧的安装包**：进 `/Volumes/编程工具/发布包/`，删掉所有旧的 `DeepSeek-Harness-Desktop-*`（dmg / app.zip / sha256），**只留最新一版**。旧版不归档、不保留，避免发布目录堆积多版本造成混淆。
+3. 命名规范：`DeepSeek-Harness-Desktop-<版本>-macos-<arch>.<dmg|app.zip>`，每个产物**都要附一个同名 `.sha256`**。
    - `<版本>` 取 `package.json` 里的 `version`；`<arch>` 取 `arm64`（Apple Silicon）。
    - 例：`DeepSeek-Harness-Desktop-1.0.1-macos-arm64.dmg` + `DeepSeek-Harness-Desktop-1.0.1-macos-arm64.dmg.sha256`
-3. **打包必须用「自包含（静态链接）的官方 Node」**，不能用 Homebrew 的 node。理由见第 1 节 —— 这是最容易踩的坑。
-4. 装到 `/Applications` 前先退出正在运行的旧实例（见第 6 节）。应用数据不在 app 里，替换 bundle 不会丢数据。
-5. **权限反复弹窗**：不要用裸 ad-hoc（每次 cdhash 都变，TCC 开关看着开着其实对不上）。打包脚本会用登录钥匙串里的本地证书 `DeepSeek Harness Local` 重签，并把 designated requirement 钉成 `identifier "ai.deepseek.harness.desktop"`。TCC 按 bundle id 认应用，重装不再反复要辅助功能 / 屏幕录制。
+4. **打包必须用「自包含（静态链接）的官方 Node」**，不能用 Homebrew 的 node。理由见第 1 节 —— 这是最容易踩的坑。
+5. 装到 `/Applications` 前先退出正在运行的旧实例（见第 6 节）。应用数据不在 app 里，替换 bundle 不会丢数据。
+6. **权限反复弹窗**：不要用裸 ad-hoc（每次 cdhash 都变，TCC 开关看着开着其实对不上）。打包脚本会用登录钥匙串里的本地证书 `DeepSeek Harness Local` 重签，并把 designated requirement 钉成 `identifier "ai.deepseek.harness.desktop"`。TCC 按 bundle id 认应用，重装不再反复要辅助功能 / 屏幕录制。
 
 ---
 
@@ -137,6 +138,11 @@ APP="/Volumes/编程工具/deepseek-harness-desktop/src-tauri/target/release/bun
 VER="1.0.1"; ARCH="arm64"                          # VER 取 package.json 的 version
 STEM="DeepSeek-Harness-Desktop-${VER}-macos-${ARCH}"
 mkdir -p "$REL"
+
+# 0) ⚠ 先删旧版（铁律第 2 条）：发布目录只留最新一版
+rm -f "$REL"/DeepSeek-Harness-Desktop-*.dmg \
+      "$REL"/DeepSeek-Harness-Desktop-*.zip \
+      "$REL"/DeepSeek-Harness-Desktop-*.sha256
 
 # 1) dmg：见第 4 节（输出到 "$REL/${STEM}.dmg"）
 # 2) 便携 zip 的 .app（保签名/属性）

@@ -138,6 +138,7 @@ var import_jsx_runtime = require("react/jsx-runtime");
 var NS = "dsh-quick-commands";
 var CLIENT_BUNDLE_ID = "dsh-quick-commands";
 var ROUTE_PREFIX = "/dsh-quick-commands";
+var SLASH_FILTER_ENABLED = false;
 var zh = {
   "button": "\u5FEB\u6377\u6307\u4EE4",
   "panel.title": "\u5FEB\u6377\u6307\u4EE4",
@@ -680,7 +681,7 @@ function QuickCommands({ input, inputActions, useInput, t: injected }) {
       document.removeEventListener("keydown", onKey);
     };
   }, [open]);
-  const slashQuery = !open && draft.startsWith("/") && !draft.includes("\n") ? draft.slice(1) : null;
+  const slashQuery = SLASH_FILTER_ENABLED && !open && draft.startsWith("/") && !draft.includes("\n") ? draft.slice(1) : null;
   const [dismissedSlash, setDismissedSlash] = (0, import_react.useState)(null);
   const [slashActive, setSlashActive] = (0, import_react.useState)(0);
   const slashMatches = (0, import_react.useMemo)(

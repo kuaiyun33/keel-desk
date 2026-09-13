@@ -11,7 +11,6 @@ class SceneStore {
     this.family = family;
     this.dir = path.join(dataDir, "scenes", family);
   }
-  logger;
   dir;
   family;
   async init() {

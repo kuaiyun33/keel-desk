@@ -6,8 +6,12 @@ A lightning button sits in the composer tool row. It opens a panel that lists
 your quick commands (pinned first); clicking one **appends** it to the input.
 You can add the current draft as a command, edit, delete, pin/unpin, drag to
 reorder (within the pinned / plain regions), and import/export a JSON file.
-Typing `/` at the start of the input opens an inline filter over the same list
-(↑↓ to select, Enter to insert, Esc to dismiss).
+
+The inline `/` filter (↑↓ select · Enter insert · Esc close) is **disabled**.
+The Harness slash pipeline only binds `/` and `@`, so the built-in 命令 palette
+opens on any `/`-leading draft; a plugin overlay on that same keystroke covered
+the palette. The composer button is the entry point. Flip
+`SLASH_FILTER_ENABLED` in `src/client.tsx` to `true` to bring the filter back.
 
 ## Shared store
 
@@ -35,7 +39,7 @@ table wholesale.
 - `src/index.mjs` — Host half: the store + an HTTP route at `/dsh-quick-commands`.
 - `src/quick-commands-core.mjs` — pure domain logic (seed / pin / reorder / import).
 - `src/shared-path.mjs` — resolves the shared file via the data-location pointer.
-- `src/client.tsx` — Browser half: the composer button, panel, and `/` filter.
+- `src/client.tsx` — Browser half: the composer button and panel (inline `/` filter off by default).
 
 ## License
 

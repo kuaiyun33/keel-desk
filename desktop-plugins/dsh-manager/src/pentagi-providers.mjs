@@ -9,6 +9,12 @@ const SYNC_PREFIX = 'dsh-'
 
 function userHome(env = process.env) {
   const configured = String(env.DSH_HOME ?? '').trim()
+  // 与 index.mjs / harness 的 resolveUserHome 保持一致地展开 `~`，
+  // 否则 DSH_HOME=~ 时凭据会读自 <cwd>/~，与实际写入位置不一致。
+  if (configured === '~') return homedir()
+  if (configured.startsWith('~/') || configured.startsWith('~\\')) {
+    return resolve(join(homedir(), configured.slice(2)))
+  }
   if (configured) return resolve(configured)
   return join(homedir(), '.dsh')
 }
@@ -280,7 +286,8 @@ export function writeCustomProviderYaml(dest, model) {
     block('pentester'),
     '',
   ].join('\n')
-  writeFileSync(dest, text)
+  // custom.provider.yml 内含 provider key 明文，收紧权限。
+  writeFileSync(dest, text, { mode: 0o600 })
   return dest
 }
 

@@ -25,6 +25,13 @@ const RANDOM_PORT_MIN = 18000
 const RANDOM_PORT_MAX = 29999
 const LOCAL_EMBED_PORT = 63229
 const LOCAL_EMBED_MODEL = 'BAAI/bge-small-en-v1.5'
+// 容器侧使用的 embedding key。embedder 现在会校验它，所以必须与注入 PentAGI 的
+// EMBEDDING_KEY 完全一致（原先这个值是散落的字面量，容易改一处漏一处）。
+const LOCAL_EMBED_KEY = 'sk-dsh-local-embed'
+// colima / Docker Desktop 的容器流量经 vmnet 接口进入宿主机，只绑 127.0.0.1
+// 会让容器永远连不上（PentAGI 侧表现为 "failed to reach API server"），
+// 而本机健康检查却仍然通过 —— 必须绑所有接口并靠 EMBEDDING_KEY 做鉴权。
+const LOCAL_EMBED_BIND = '0.0.0.0'
 
 function readPentagiSettings(env = process.env) {
   try {
@@ -147,6 +154,13 @@ function API_URL(env = process.env) {
 function userHome(env = process.env) {
   const configured = String(env.DSH_HOME ?? '').trim()
   if (!configured) return join(homedir(), '.dsh')
+  // 必须展开 `~`：index.mjs 与 harness 侧的 resolveUserHome 都展开，这里若只做
+  // resolve('~') 会得到 <cwd>/~ —— token / .env / settings 被写到另一个目录，
+  // 面板便永远 tokenPresent:false，pg_flow_* 永远报 missing token。
+  if (configured === '~') return homedir()
+  if (configured.startsWith('~/') || configured.startsWith('~\\')) {
+    return resolve(join(homedir(), configured.slice(2)))
+  }
   return resolve(configured)
 }
 
@@ -191,11 +205,28 @@ function run(command, args, options = {}) {
     let stdout = ''
     let stderr = ''
     let settled = false
+    // 始终用 spawnEnv 合并 EXTRA_PATH + DOCKER_HOST，不区分调用方有没有传 env。
+    // 根因：重启后 Tauri 进程的 process.env.PATH 是最小集（不含 /opt/homebrew/bin），
+    // 而 installDockerStack / startColima / runCompose 都会透传 env 给 run()，
+    // 旧逻辑 options.env 有值就不补路径，导致子进程（colima → limactl）报
+    // "executable file not found in $PATH"，PentAGI 面板直接死在启动第一步。
+    const merged = { ...spawnEnv(options.env ?? process.env) }
+    // composeEnv 会 delete DOCKER_HOST 等键再设 PENTAGI_DOCKER_SOCKET——
+    // 保留调用方的意图，spawnEnv 的默认值不得覆盖显式操作。
+    if (options.env) {
+      const caller = options.env
+      // 处理显式 delete（key 不在 caller 自身，或值为 undefined）
+      for (const k of Object.keys(merged)) {
+        if (!(k in caller) && k !== 'PATH') delete merged[k]
+      }
+      for (const [k, v] of Object.entries(caller)) {
+        if (v === undefined) merged[k] = undefined
+        else merged[k] = v
+      }
+    }
     const child = spawn(command, args, {
       cwd: options.cwd,
-      // 调用方显式传 env（如 composeEnv 已按需删掉 DOCKER_HOST）时直接透传；
-      // 只有没传 env 的普通调用才做一次 PATH 扩展 + DOCKER_HOST 注入。
-      env: options.env === undefined ? spawnEnv(process.env) : options.env,
+      env: merged,
       shell: false,
     })
     const timer = setTimeout(() => {
@@ -204,10 +235,11 @@ function run(command, args, options = {}) {
       child.kill('SIGKILL')
       resolvePromise({ ok: false, code: -1, stdout, stderr: `${stderr}\ntimed out after ${timeoutMs}ms`.trim() })
     }, timeoutMs)
+    // 输出上限：与 pentagi.mjs 的 spawnCommand 一致，避免长命令吃光内存。
+    const MAX_CAPTURE = 512_000
     const take = (chunk, sink) => {
       const text = chunk.toString()
-      if (sink === 'out') stdout += text
-      else stderr += text
+      if (sink === 'out') { if (stdout.length < MAX_CAPTURE) stdout += text } else if (stderr.length < MAX_CAPTURE) stderr += text
       const line = text.trim()
       if (line) onLog?.(line)
     }
@@ -225,6 +257,10 @@ function run(command, args, options = {}) {
       clearTimeout(timer)
       resolvePromise({ ok: code === 0, code: code ?? 1, stdout, stderr })
     })
+    // stdin 立即 EOF：brew install / choco install 这类要 sudo 确认的命令原先会
+    // 一直等 stdin 输入，直到 15~20 分钟超时才被 SIGKILL（诊断也极难）。
+    child.stdin?.on('error', () => { /* EPIPE 竞态：忽略 */ })
+    child.stdin?.end()
   })
 }
 
@@ -243,6 +279,10 @@ function pentagiRoot(env = process.env) {
 }
 
 function insecureHttpsRequest(url, init = {}) {
+  // docker-proxy 会先接受 TCP 连接、再由未就绪的容器回应 —— 连接建立成功但
+  // 响应永不到达。没有超时/信号处理时 Promise 永不 settle，waitForApi 的
+  // deadline 再也评估不到，导致 /pentagi/start 永久挂死、isRunning 永远为 true。
+  const timeoutMs = Number(init.timeoutMs) > 0 ? Number(init.timeoutMs) : 20_000
   return new Promise((resolvePromise, reject) => {
     const u = new URL(url)
     const headers = { ...(init.headers ?? {}) }
@@ -255,6 +295,7 @@ function insecureHttpsRequest(url, init = {}) {
       rejectUnauthorized: false,
     }, (res) => {
       const chunks = []
+      res.on('error', reject)
       res.on('data', c => chunks.push(c))
       res.on('end', () => {
         const buf = Buffer.concat(chunks)
@@ -272,9 +313,17 @@ function insecureHttpsRequest(url, init = {}) {
           },
           text: async () => buf.toString('utf8'),
           json: async () => JSON.parse(buf.toString('utf8')),
+          // 二进制下载（flow files zip、pg_browser screenshot）需要原始字节，
+          // 用 text() 会把图像/ZIP 按 UTF-8 解码成乱码。
+          arrayBuffer: async () => buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength),
         })
       })
     })
+    req.setTimeout(timeoutMs, () => req.destroy(new Error(`timeout after ${timeoutMs}ms: ${init.method || 'GET'} ${u.pathname}`)))
+    if (init.signal) {
+      if (init.signal.aborted) { req.destroy(new Error('aborted')); return }
+      init.signal.addEventListener('abort', () => req.destroy(new Error('aborted')), { once: true })
+    }
     req.on('error', reject)
     if (init.body) req.write(init.body)
     req.end()
@@ -372,8 +421,45 @@ function ensureEnvFile(root, env = process.env) {
   set('LOCAL_SCRAPER_USERNAME', 'someuser')
   set('LOCAL_SCRAPER_PASSWORD', 'somepass')
   mkdirSync(root, { recursive: true })
-  writeFileSync(dest, text)
+  // .env 内含 LLM_SERVER_KEY 明文，默认 0644 会被同机其他用户读到。
+  writeFileSync(dest, text, { mode: 0o600 })
   return dest
+}
+
+/** 让 PentAGI 后端能真正连到本机向量服务。
+ *
+ *  colima 的 daemon DNS 会把 host.docker.internal 解析成 198.18.0.127 —— 这是
+ *  Docker Desktop 的惯例地址，colima 里根本不存在（宿主机上只有 198.18.0.1/30）。
+ *  实测后果：容器内 TCP 探测甚至显示"连得上"，但请求永远到不了宿主机 embedder，
+ *  PentAGI 侧报 "failed to reach API server" —— agent 每存一次长期记忆都失败，
+ *  重试到上限后整条「执行工具 → 存记忆」循环崩溃（pg_advice 会直接回吐该错误链）。
+ *
+ *  colima 的真实网关是 colima.yaml 里的 gatewayAddress（实测 192.168.5.2），
+ *  用 extra_hosts 的 host-gateway 让 docker 自己填。写进 override 文件而不是改
+ *  官方 docker-compose.yml，避免被上游更新覆盖。
+ */
+function ensureComposeOverride(root, onLog = () => {}) {
+  const dest = join(root, 'docker-compose.override.yml')
+  const body = [
+    '# 由 DeepSeek Harness Desktop 生成，请勿手工编辑（每次启动会重写）。',
+    '# 原因：colima 的 daemon DNS 把 host.docker.internal 解析成并不存在的',
+    '# 198.18.0.127，导致 PentAGI 后端连不上本机 embedding 服务，',
+    '# agent 存长期记忆时整条调用链会重试到失败。',
+    'services:',
+    '  pentagi:',
+    '    extra_hosts:',
+    '      - "host.docker.internal:host-gateway"',
+    '',
+  ].join('\n')
+  try {
+    if (existsSync(dest) && readFileSync(dest, 'utf8') === body) return dest
+    writeFileSync(dest, body)
+    onLog('已写入 docker-compose.override.yml（host.docker.internal → host-gateway，修复容器到本机向量服务的路由）')
+    return dest
+  } catch (error) {
+    onLog(`写 compose override 失败：${error?.message ?? error}`)
+    return ''
+  }
 }
 
 export function pentagiEnvPath(env = process.env) {
@@ -383,7 +469,7 @@ export function pentagiEnvPath(env = process.env) {
 export function writePentagiEnvText(text, env = process.env) {
   const dest = pentagiEnvPath(env)
   mkdirSync(dirname(dest), { recursive: true })
-  writeFileSync(dest, text)
+  writeFileSync(dest, text, { mode: 0o600 })
   return dest
 }
 
@@ -401,6 +487,12 @@ function composeEnv(env = process.env) {
 }
 
 let composeMode = 'unknown' // unknown | docker | legacy | missing（进程内缓存探测结果）
+let composeModeAt = 0
+// 缓存必须能失效：installDockerStack 可能刚把 docker/compose 装好，若 composeMode
+// 永远停在 'missing'，之后每次 `docker compose up -d` 都报「插件不可用」，
+// 用户只能重启 app 才能恢复。
+const COMPOSE_MODE_TTL_MS = 30_000
+export function resetComposeMode() { composeMode = 'unknown'; composeModeAt = 0 }
 
 /**
  * 探测本机可用的 compose 形态：
@@ -409,14 +501,16 @@ let composeMode = 'unknown' // unknown | docker | legacy | missing（进程内�
  *  - 'missing'：都不可用。
  */
 async function composeAvailable(docker, env) {
-  if (composeMode !== 'unknown') return composeMode
+  if (composeMode !== 'unknown' && Date.now() - composeModeAt < COMPOSE_MODE_TTL_MS) return composeMode
   const probe = await run(docker, ['compose', 'version'], { timeoutMs: 8_000, env })
   if (probe.ok) {
     composeMode = 'docker'
+    composeModeAt = Date.now()
     return composeMode
   }
   const legacy = which('docker-compose', env)
   composeMode = (legacy !== 'docker-compose' && existsSync(legacy)) ? 'legacy' : 'missing'
+  composeModeAt = Date.now()
   return composeMode
 }
 
@@ -511,12 +605,27 @@ async function checkDaemonDns(docker, onLog, env) {
 
 async function writeDaemonJsonDns(onLog, env) {
   const path = join(homedir(), '.docker', 'daemon.json')
-  let conf = {}
-  try { conf = JSON.parse(readFileSync(path, 'utf8')) } catch { conf = {} }
+  // 解析失败（文件被别的工具写成带注释 / 尾部逗号，或写到一半）时，旧代码会把
+  // conf 当 {} 用，随后整文件覆盖成只剩 dns —— 用户的 registry-mirrors /
+  // insecure-registries / builder 配置就此静默丢失。此时保原文件、不写。
+  let conf = null
+  let existed = false
+  if (existsSync(path)) {
+    existed = true
+    try { conf = JSON.parse(readFileSync(path, 'utf8')) } catch { conf = null }
+  }
+  if (conf === null && existed) {
+    onLog(`跳过：${path} 不是合法 JSON，已保留原文件（请手动修正后重试 DNS 自愈）`)
+    return path
+  }
+  conf ??= {}
+  if (existed) {
+    try { copyFileSync(path, `${path}.dsh.bak`) } catch { /* 备份失败不阻断 */ }
+  }
   conf.dns = ['8.8.8.8', '1.1.1.1', '223.5.5.5']
   mkdirSync(dirname(path), { recursive: true })
-  writeFileSync(path, JSON.stringify(conf, null, 2))
-  onLog(`已写 ${path} 的 dns: 8.8.8.8 / 1.1.1.1 / 223.5.5.5`)
+  writeFileSync(path, JSON.stringify(conf, null, 2), { mode: 0o600 })
+  onLog(`已写 ${path} 的 dns: 8.8.8.8 / 1.1.1.1 / 223.5.5.5${existed ? '（原文件备份为 daemon.json.dsh.bak）' : ''}`)
   return path
 }
 
@@ -624,14 +733,45 @@ async function installBrewPackages(packages, onLog, env) {
 
 async function startColima(onLog, env) {
   const colima = which('colima', env)
+  if (colima === 'colima' || !existsSync(colima)) {
+    return { ok: false, stderr: 'colima 未安装。请运行 brew install colima 或安装 Docker Desktop。' }
+  }
   const arch = hostArch() === 'arm64' ? 'aarch64' : 'x86_64'
   const args = ['start', '--arch', arch]
   if (process.platform === 'darwin' && hostArch() === 'arm64') args.push('--vm-type', 'vz')
-  onLog(`$ colima ${args.join(' ')}`)
+  onLog(`$ ${colima} ${args.join(' ')}  ← 首次启动约需 60~120 秒，请耐心等待…`)
   const started = await run(colima, args, { timeoutMs: 8 * 60_000, env, onLog })
   if (started.ok) return started
-  onLog('指定参数启动失败，改用 colima start 默认配置…')
+  // 常见情况：端口占用 / 旧实例未完全释放。加一句诊断输出帮排查。
+  onLog(`colima start 失败：${(started.stderr || '').split('\n').slice(0, 3).join(' | ')}`)
+  onLog('改用 colima start 默认配置重试…')
   return run(colima, ['start'], { timeoutMs: 8 * 60_000, env, onLog })
+}
+
+/**
+ * 冷启动预检：重启后 colima VM 通常还没起来，直接打 docker info 必挂。
+ * 在 ensureDocker 之前先用最小命令确认 colima 状态，该拉的拉、该等的等，
+ * 把启动失败率从「重启必挂」降到「最多等 2 分钟」。
+ */
+async function preFlightColima(onLog, env) {
+  const colima = which('colima', env)
+  if (colima === 'colima' || !existsSync(colima)) {
+    onLog('colima 不在 PATH，跳过预检（后续由 ensureDocker 诊断）')
+    return
+  }
+  const status = await run(colima, ['status'], { timeoutMs: 10_000, env })
+  const running = /colima is running/i.test(status.stdout + status.stderr)
+  if (running) {
+    onLog('colima 已运行，跳过预检')
+    return
+  }
+  onLog('colima 未运行，正在启动 VM（首次约需 60~120 秒）…')
+  const started = await startColima(onLog, env)
+  if (!started.ok) {
+    onLog(`colima 预检启动失败：${(started.stderr || '').split('\n')[0] ?? 'unknown'}（后续 ensureDocker 会再诊断）`)
+    return
+  }
+  onLog('colima VM 已就绪')
 }
 
 async function pullPentagiImages(docker, onLog, env) {
@@ -835,7 +975,8 @@ function persistToken(token, env = process.env) {
   settings.coldbrew.pentagi.url = API_URL(env)
   settings.coldbrew.pentagi.port = pentagiListenPort(env)
   mkdirSync(userHome(env), { recursive: true })
-  writeFileSync(dest, JSON.stringify(settings, null, 2))
+  // token 明文，收紧权限。
+  writeFileSync(dest, JSON.stringify(settings, null, 2), { mode: 0o600 })
   return dest
 }
 
@@ -986,6 +1127,35 @@ async function probeLocalEmbed(env = process.env) {
   }
 }
 
+/** 容器视角的真实可达性。
+ *  宿主机 loopback 通只说明"本机能用"，容器走的是 vmnet 接口 + 各自的 DNS，
+ *  两者可以完全脱节：colima 下 pentagi 容器把 host.docker.internal 解析成
+ *  并不存在的 198.18.0.127，TCP 探测甚至报 open，但请求永远到不了 embedder。
+ *  所以必须真的进容器里发一次 HTTP 才算数。 */
+export async function probeLocalEmbedFromContainer(env = process.env) {
+  const docker = which('docker', env)
+  if (!docker) return { ok: false, error: 'docker not found' }
+  const port = localEmbedPort(env)
+  const ps = await run(docker, ['ps', '--format', '{{.Names}}'], { timeoutMs: 8_000, env }).catch(() => ({ stdout: '' }))
+  const names = String(ps.stdout || '').split(/\s+/).map(s => s.trim()).filter(Boolean)
+  // 优先问真正要访问向量服务的 pentagi 后端容器。
+  const name = names.find(n => n === 'pentagi') || names.find(n => n.startsWith('pentagi')) || names[0]
+  if (!name) return { ok: false, error: 'no running container to probe from' }
+  const script = [
+    `u=http://host.docker.internal:${port}/health`,
+    'if command -v curl >/dev/null 2>&1; then curl -sf -m 6 "$u"; exit $?; fi',
+    'if command -v wget >/dev/null 2>&1; then wget -q -O - --timeout=6 "$u"; exit $?; fi',
+    `if command -v nc >/dev/null 2>&1; then printf "GET /health HTTP/1.0\\r\\n\\r\\n" | nc -w 6 host.docker.internal ${port}; exit $?; fi`,
+    'echo NO_CLIENT; exit 3',
+  ].join('\n')
+  const probe = await run(docker, ['exec', name, 'sh', '-c', script], { timeoutMs: 15_000, env })
+    .catch(error => ({ ok: false, stdout: '', stderr: String(error?.message ?? error) }))
+  const out = String(probe.stdout || '')
+  if (out.includes('"ok"')) return { ok: true, container: name, port }
+  if (out.includes('NO_CLIENT')) return { ok: false, container: name, error: 'no http client in container (curl/wget/nc)' }
+  return { ok: false, container: name, error: (probe.stderr || out || 'container probe failed').trim().slice(0, 400) }
+}
+
 function embedderScript() {
   const src = join(here, 'embedder-server.py')
   if (existsSync(src)) return src
@@ -1025,9 +1195,39 @@ function embedderLogPath(env = process.env) {
   return join(userHome(env), 'pentagi', 'embedder.log')
 }
 
+/** 探测当前 embedder 绑的是 127.0.0.1 还是 *（0.0.0.0）。
+ *  重启后 DSH 可能用旧 lib spawn 的老进程，老代码绑 127.0.0.1，
+ *  容器走 host.docker.internal 不一定通。必须改成 *:63229 才覆盖所有场景。 */
+async function probeEmbedderBind(env = process.env) {
+  const port = localEmbedPort(env)
+  try {
+    const r = await run(which('lsof', env), ['-nP', '-iTCP:' + port, '-sTCP:LISTEN'], { timeoutMs: 5_000, env })
+    if (!r.ok) return { bound: 'unknown', raw: '' }
+    const raw = r.stdout
+    if (/127\.0\.0\.1:\d+\s/.test(raw)) return { bound: '127.0.0.1', raw }
+    if (/\*:\d+\s/.test(raw) || /0\.0\.0\.0:\d+\s/.test(raw)) return { bound: '*', raw }
+    return { bound: 'unknown', raw: raw.slice(0, 120) }
+  } catch { return { bound: 'unknown', raw: '' } }
+}
+
 export async function ensureLocalEmbedder(onLog = () => {}, env = process.env) {
   const live = await probeLocalEmbed(env)
-  if (live.ok) return { ok: true, started: false, url: localEmbedUrl(env), containerUrl: localEmbedContainerUrl(env), model: LOCAL_EMBED_MODEL }
+  if (live.ok) {
+    // 检查绑口：旧代码绑 127.0.0.1，新代码（LOCAL_EMBED_BIND）绑 0.0.0.0。
+    // 发现旧进程时，先杀再启，让容器走 host.docker.internal 必定通。
+    const bind = await probeEmbedderBind(env)
+    if (bind.bound === '127.0.0.1') {
+      onLog(`检测到向量服务仍绑在 127.0.0.1（旧代码产物），正在自动重启为 ${LOCAL_EMBED_BIND}…`)
+      await stopLocalEmbedder(() => {}, env)
+      // 杀完后需要走下面的启动流程，不 return
+    } else {
+      const reach = await probeLocalEmbedFromContainer(env)
+      if (!reach.ok) {
+        onLog(`警告：本机向量服务在 ${localEmbedUrl(env)} 可访问，但容器视角不可达（${reach.container ?? '?'}：${reach.error ?? 'unknown'}）。PentAGI 会报 "failed to reach API server"，agent 存长期记忆的整条链路会重试到失败；请确认已绑定 ${LOCAL_EMBED_BIND} 且 compose override 的 host-gateway 生效。`)
+      }
+      return { ok: true, started: false, url: localEmbedUrl(env), containerUrl: localEmbedContainerUrl(env), model: LOCAL_EMBED_MODEL, containerReach: reach }
+    }
+  }
   const script = embedderScript()
   if (!existsSync(script)) return { ok: false, error: `missing ${script}` }
   const deps = await ensureFastembed(onLog, env)
@@ -1040,9 +1240,10 @@ export async function ensureLocalEmbedder(onLog = () => {}, env = process.env) {
   const child = spawn(py, [script], {
     env: {
       ...spawnEnv(env),
-      DSH_EMBED_BIND: '127.0.0.1',
+      DSH_EMBED_BIND: LOCAL_EMBED_BIND,
       DSH_EMBED_PORT: String(localEmbedPort(env)),
       DSH_EMBED_MODEL: LOCAL_EMBED_MODEL,
+      DSH_EMBED_KEY: LOCAL_EMBED_KEY,
     },
     detached: true,
     stdio: 'ignore',
@@ -1056,10 +1257,17 @@ export async function ensureLocalEmbedder(onLog = () => {}, env = process.env) {
     const again = await probeLocalEmbed(env)
     if (again.ok) {
       onLog('本机向量服务已就绪')
-      return { ok: true, started: true, installed: deps.installed, pid: child.pid, url: localEmbedUrl(env), containerUrl: localEmbedContainerUrl(env), model: LOCAL_EMBED_MODEL }
+      const reach = await probeLocalEmbedFromContainer(env)
+      if (reach.ok) onLog(`容器视角可达：${reach.container} → :${reach.port}`)
+      else onLog(`警告：容器视角仍不可达（${reach.container ?? '?'}：${reach.error ?? 'unknown'}），PentAGI 的长期记忆写入会失败`)
+      return { ok: true, started: true, installed: deps.installed, pid: child.pid, url: localEmbedUrl(env), containerUrl: localEmbedContainerUrl(env), model: LOCAL_EMBED_MODEL, containerReach: reach }
     }
     if (i === 14 || i === 44 || i === 74) onLog(`仍在等待模型加载… ${i * 2}s`)
   }
+  // 健康检查失败后必须回收：否则这个失败进程仍在跑（持有 ~270MB 模型、占着端口），
+  // 用户下次点「启动」又会 spawn 一个，越积越多。detached 起的是新进程组，
+  // 用负 pid 按组杀，顺带带走它可能拉起的子进程。
+  try { process.kill(-child.pid, 'SIGKILL') } catch { try { child.kill('SIGKILL') } catch { /* 已退出 */ } }
   return { ok: false, error: 'local embedder did not become healthy (first install can take several minutes; check python3 and network)', pid: child.pid, url: localEmbedUrl(env) }
 }
 
@@ -1068,11 +1276,23 @@ export async function stopLocalEmbedder(onLog = () => {}, env = process.env) {
   const listed = await run(which('lsof', env), ['-ti', `tcp:${port}`], { timeoutMs: 5_000, env })
   const pids = listed.stdout.split(/\s+/).map(s => s.trim()).filter(Boolean)
   if (!pids.length) return { ok: true, stopped: false, note: 'not running' }
+  // 按端口无差别杀会误伤：如果 63229 被无关进程占用（或用户把 DSH_EMBED_PORT
+  // 指到已用端口），原实现会直接把别人的进程 SIGTERM 掉。必须先核对命令行。
+  const ps = which('ps', env)
+  const stopped = []
+  const skipped = []
   for (const pid of pids) {
-    try { process.kill(Number(pid), 'SIGTERM') } catch { /* gone */ }
+    const cmd = await run(ps, ['-p', pid, '-o', 'command='], { timeoutMs: 3_000, env }).catch(() => ({ stdout: '' }))
+    if (!String(cmd.stdout || '').includes('embedder-server.py')) {
+      skipped.push(pid)
+      continue
+    }
+    try { process.kill(Number(pid), 'SIGTERM'); stopped.push(pid) } catch { /* gone */ }
   }
-  onLog(`stopped local embedder on :${port} (${pids.join(',')})`)
-  return { ok: true, stopped: true, pids }
+  if (skipped.length) onLog(`跳过占用 :${port} 但非本机向量服务的进程 (${skipped.join(',')})`)
+  if (!stopped.length) return { ok: true, stopped: false, note: 'port held by a foreign process', skipped }
+  onLog(`stopped local embedder on :${port} (${stopped.join(',')})`)
+  return { ok: true, stopped: true, pids: stopped, skipped }
 }
 
 export async function resolveEmbeddingForEnv(onLog = () => {}, env = process.env) {
@@ -1102,7 +1322,7 @@ export async function resolveEmbeddingForEnv(onLog = () => {}, env = process.env
       source,
       provider: 'openai',
       url: localEmbedContainerUrl(env),
-      key: 'sk-dsh-local-embed',
+      key: LOCAL_EMBED_KEY,
       model: LOCAL_EMBED_MODEL,
     }
   }
@@ -1121,37 +1341,44 @@ export function savePentagiSettings(patch = {}, env = process.env) {
     settings.coldbrew.pentagi.url = `https://127.0.0.1:${Number(patch.port)}`
   }
   mkdirSync(userHome(env), { recursive: true })
-  writeFileSync(dest, JSON.stringify(settings, null, 2))
+  // desktop-settings.json 里含 PentAGI GraphQL token 明文，收紧权限。
+  writeFileSync(dest, JSON.stringify(settings, null, 2), { mode: 0o600 })
   return settings.coldbrew.pentagi
 }
 
 export async function startPentagiRuntime(onLog = () => {}, env = process.env) {
+  // 始终用完整环境启动：重启后 Tauri 进程的 process.env 缺 /opt/homebrew/bin，
+  // 不补上的话 `which colima` 与子进程都会挂。
+  const fullEnv = spawnEnv(env)
   // 启动前先把对外端口选好并落盘（随机空闲端口，避开 8443），compose 与 probe 都读同一个。
-  await ensureRandomListenPort(env, onLog)
-  const dockerReady = await ensureDocker(onLog, env)
+  await ensureRandomListenPort(fullEnv, onLog)
+  // 冷启动预检：重启后 colima VM 未拉起，直接打 docker info 必挂。
+  await preFlightColima(onLog, fullEnv)
+  const dockerReady = await ensureDocker(onLog, fullEnv)
   if (!dockerReady.ok) throw new Error(dockerReady.error || 'docker daemon not running')
-  let root = pentagiRoot(env)
+  let root = pentagiRoot(fullEnv)
   if (!existsSync(join(root, 'docker-compose.yml'))) {
     onLog(`clone pentagi → ${root}`)
     mkdirSync(dirname(root), { recursive: true })
-    const cloned = await run(which('git', env), ['clone', '--depth', '1', 'https://github.com/vxcontrol/pentagi.git', root], {
-      timeoutMs: 180_000, env, onLog,
+    const cloned = await run(which('git', fullEnv), ['clone', '--depth', '1', 'https://github.com/vxcontrol/pentagi.git', root], {
+      timeoutMs: 180_000, env: fullEnv, onLog,
     })
     if (!cloned.ok) throw new Error(cloned.stderr || 'git clone failed')
   }
-  ensureEnvFile(root, env)
+  ensureEnvFile(root, fullEnv)
+  ensureComposeOverride(root, onLog)
   let harnessLlm = null
   try {
     const { inspectHarnessLlms, pickHarnessLlm, applyLlmToEnvText, llmFingerprint, syncGraphqlProviders } = await import('./pentagi-providers.mjs')
-    const inspected = await inspectHarnessLlms(env)
-    const pick = pickHarnessLlm(inspected, env)
+    const inspected = await inspectHarnessLlms(fullEnv)
+    const pick = pickHarnessLlm(inspected, fullEnv)
     if (pick) {
       const dest = join(root, '.env')
       const prev = existsSync(dest) ? readFileSync(dest, 'utf8') : ''
-      const embedding = await resolveEmbeddingForEnv(onLog, env)
+      const embedding = await resolveEmbeddingForEnv(onLog, fullEnv)
       const next = applyLlmToEnvText(prev, pick, { embedding })
       if (next !== prev) {
-        writeFileSync(dest, next)
+        writeFileSync(dest, next, { mode: 0o600 })
         onLog(`同步 Harness 模型 ${pick.displayName}/${pick.probe?.model || pick.model} → LLM_SERVER_*`)
       }
       harnessLlm = { pick, inspected, fingerprint: llmFingerprint(pick), embedding }
@@ -1164,20 +1391,20 @@ export async function startPentagiRuntime(onLog = () => {}, env = process.env) {
   let up = { ok: false, stderr: '', stdout: '' }
   for (let attempt = 1; attempt <= 4; attempt++) {
     onLog(`$ docker compose up -d  (${root})  attempt ${attempt}/4`)
-    up = await runCompose(dockerReady.docker, ['up', '-d'], { cwd: root, timeoutMs: 15 * 60_000, env: composeEnv(env), onLog })
+    up = await runCompose(dockerReady.docker, ['up', '-d'], { cwd: root, timeoutMs: 15 * 60_000, env: composeEnv(fullEnv), onLog })
     if (up.ok) break
     onLog(`compose 失败，20s 后重试：${(up.stderr || up.stdout || '').split('\n').pop()}`)
     await new Promise(r => setTimeout(r, 20_000))
   }
   if (!up.ok) throw new Error(up.stderr || up.stdout || 'docker compose up failed')
-  const api = await waitForApi(onLog, 180_000, env)
+  const api = await waitForApi(onLog, 180_000, fullEnv)
   if (!api.ok) throw new Error(api.error)
-  const boot = await ensurePentagiApiToken(onLog, env)
+  const boot = await ensurePentagiApiToken(onLog, fullEnv)
   if (!boot.ok) throw new Error(boot.error)
   if (harnessLlm?.pick) {
     try {
       const { syncGraphqlProviders } = await import('./pentagi-providers.mjs')
-      const synced = await syncGraphqlProviders(harnessLlm.pick, harnessLlm.inspected, env)
+      const synced = await syncGraphqlProviders(harnessLlm.pick, harnessLlm.inspected, fullEnv)
       onLog(synced.ok
         ? `GraphQL provider ${synced.name} 已对齐（${synced.model}）`
         : `GraphQL provider 同步失败：${JSON.stringify(synced.upsert?.errors || synced.error || synced).slice(0, 240)}`)
@@ -1185,7 +1412,7 @@ export async function startPentagiRuntime(onLog = () => {}, env = process.env) {
       onLog(`GraphQL provider 同步失败：${error?.message ?? error}`)
     }
   }
-  const status = await probePentagiRuntime(env)
+  const status = await probePentagiRuntime(fullEnv)
   return {
     ...status,
     harnessLlm: harnessLlm && {

@@ -708,7 +708,7 @@ dependencies = [
 
 [[package]]
 name = "deepseek-harness-desktop"
-version = "1.0.1"
+version = "1.0.4"
 dependencies = [
  "dunce",
  "reqwest 0.12.28",

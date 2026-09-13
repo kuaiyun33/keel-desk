@@ -1,6 +1,6 @@
 [package]
 name = "deepseek-harness-desktop"
-version = "1.0.3"
+version = "1.0.4"
 description = "A lightweight, cross-platform Tauri desktop shell for DeepSeek Harness"
 authors = ["WJZ_P"]
 edition = "2024"

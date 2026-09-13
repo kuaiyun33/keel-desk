@@ -8,7 +8,6 @@ class PersonaStore {
     this.family = family;
     this.file = path.join(dataDir, `persona-${family}.md`);
   }
-  logger;
   file;
   family;
   /** 旧布局迁移：persona.md → persona-chat.md（幂等，仅 chat 族执行）。 */

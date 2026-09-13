@@ -82,12 +82,6 @@ class MemoryRunner {
     this.modes = modes;
     this.pendingFile = pendingPathFor(resolveDataDir(cfg));
   }
-  ctx;
-  cfg;
-  stores;
-  logger;
-  live;
-  modes;
   tasks = [];
   draining = false;
   /** 停止标志（dispose 序置位）：不再取新任务；进行中任务自然收尾，其 DB 写入失败由各层兜底捕获。 */

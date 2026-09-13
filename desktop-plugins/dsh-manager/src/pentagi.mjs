@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process'
-import { mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs'
+import { mkdirSync, readFileSync, writeFileSync, existsSync, statSync } from 'node:fs'
 import https from 'node:https'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
@@ -21,6 +21,12 @@ export const PENTAGI_TOOL_PREFIX = 'pg_'
 function userHome(env = process.env) {
   const configured = String(env.DSH_HOME ?? '').trim()
   if (configured.length === 0) return join(homedir(), '.dsh')
+  // 与 index.mjs / harness 的 resolveUserHome 保持一致地展开 `~`，
+  // 否则 DSH_HOME=~ 时这里会写到 <cwd>/~，与面板读写的位置不是同一个。
+  if (configured === '~') return homedir()
+  if (configured.startsWith('~/') || configured.startsWith('~\\')) {
+    return resolve(join(homedir(), configured.slice(2)))
+  }
   return resolve(configured)
 }
 
@@ -132,8 +138,11 @@ function spawnCommand(command, args, options = {}) {
       child.kill('SIGKILL')
       resolvePromise({ ok: false, code: -1, stdout, stderr: `${stderr}\ntimed out after ${timeoutMs}ms`.trim() })
     }, timeoutMs)
-    child.stdout?.on('data', chunk => { stdout += chunk.toString() })
-    child.stderr?.on('data', chunk => { stderr += chunk.toString() })
+    // 输出必须有上限：`cat` 大文件或全端口 nmap 的 stdout 原先无上限累积，
+    // 到返回时才 slice，host 进程可能先吃掉几 GB 内存。
+    const MAX_CAPTURE = 512_000
+    child.stdout?.on('data', chunk => { if (stdout.length < MAX_CAPTURE) stdout += chunk.toString() })
+    child.stderr?.on('data', chunk => { if (stderr.length < MAX_CAPTURE) stderr += chunk.toString() })
     child.once('error', (error) => {
       if (settled) return
       settled = true
@@ -146,7 +155,11 @@ function spawnCommand(command, args, options = {}) {
       clearTimeout(timer)
       resolvePromise({ ok: code === 0, code: code ?? 1, stdout, stderr })
     })
-    if (options.input !== undefined) child.stdin.end(options.input)
+    // `sh -lc 'exit 0'` 这类瞬时命令可能在 end() 落地前就退出，写 stdin 会以
+    // 'error' 事件返回 EPIPE；无监听器时同样会升级成 uncaught 打挂 host。
+    // 顺带补上可选链 —— input 存在时原先直接 child.stdin.end 会抛 TypeError。
+    child.stdin?.on('error', () => { /* EPIPE 竞态：忽略 */ })
+    if (options.input !== undefined) child.stdin?.end(options.input)
     else child.stdin?.end()
   })
 }
@@ -189,10 +202,11 @@ function extractLinks(html, baseUrl) {
 }
 
 async function httpGet(url, options = {}) {
+  const target = normalizeHttpTarget(url)
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? 20_000)
   try {
-    const response = await fetch(url, {
+    const response = await fetch(target, {
       signal: controller.signal,
       redirect: 'follow',
       headers: {
@@ -201,6 +215,20 @@ async function httpGet(url, options = {}) {
         ...(options.headers ?? {}),
       },
     })
+    // 二进制（PNG 截图等）必须在 text() 之前决定读取方式：body 只能消费一次，
+    // 先 text() 再 arrayBuffer() 会直接抛错。
+    if (options.binary === true) {
+      const buf = Buffer.from(await response.arrayBuffer())
+      return {
+        ok: response.ok,
+        status: response.status,
+        url: response.url,
+        binary: true,
+        bytes: buf.length,
+        base64: buf.toString('base64'),
+        headers: Object.fromEntries(response.headers),
+      }
+    }
     const text = await response.text()
     return { ok: response.ok, status: response.status, url: response.url, text, headers: Object.fromEntries(response.headers) }
   } finally {
@@ -209,6 +237,10 @@ async function httpGet(url, options = {}) {
 }
 
 function pentagiHttps(url, init = {}, redirects = 0) {
+  // 与 pentagi-runtime 的 insecureHttpsRequest 同因：graphql() 传进来的
+  // AbortController.signal 原先被这里丢弃，20s 超时形同虚设，后端半死时
+  // 所有 pg_* 工具会一起永久挂起。
+  const timeoutMs = Number(init.timeoutMs) > 0 ? Number(init.timeoutMs) : 20_000
   return new Promise((resolvePromise, reject) => {
     const u = new URL(url)
     const req = https.request({
@@ -220,6 +252,7 @@ function pentagiHttps(url, init = {}, redirects = 0) {
       rejectUnauthorized: false,
     }, (res) => {
       const chunks = []
+      res.on('error', reject)
       res.on('data', c => chunks.push(c))
       res.on('end', () => {
         const method = String(init.method || 'GET').toUpperCase()
@@ -232,6 +265,18 @@ function pentagiHttps(url, init = {}, redirects = 0) {
           return
         }
         const buf = Buffer.concat(chunks)
+        if (init.binary === true) {
+          resolvePromise({
+            ok: res.statusCode >= 200 && res.statusCode < 300,
+            status: res.statusCode,
+            url,
+            headers: res.headers ?? {},
+            binary: true,
+            bytes: buf.length,
+            base64: buf.toString('base64'),
+          })
+          return
+        }
         resolvePromise({
           ok: res.statusCode >= 200 && res.statusCode < 300,
           status: res.statusCode,
@@ -239,9 +284,15 @@ function pentagiHttps(url, init = {}, redirects = 0) {
           headers: res.headers ?? {},
           text: async () => buf.toString('utf8'),
           json: async () => JSON.parse(buf.toString('utf8')),
+          arrayBuffer: async () => buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength),
         })
       })
     })
+    req.setTimeout(timeoutMs, () => req.destroy(new Error(`timeout after ${timeoutMs}ms: ${init.method || 'GET'} ${u.pathname}`)))
+    if (init.signal) {
+      if (init.signal.aborted) { req.destroy(new Error('aborted')); return }
+      init.signal.addEventListener('abort', () => req.destroy(new Error('aborted')), { once: true })
+    }
     req.on('error', reject)
     if (init.body) req.write(init.body)
     req.end()
@@ -302,7 +353,7 @@ export function buildMultipart(files = []) {
   return { body: Buffer.concat(chunks), contentType: `multipart/form-data; boundary=${boundary}`, boundary }
 }
 
-async function rest(method, path, { query, json, raw, multipart, headers: extraHeaders } = {}, env = process.env) {
+async function rest(method, path, { query, json, raw, multipart, binary, headers: extraHeaders } = {}, env = process.env) {
   const token = pentagiToken(env)
   const url = new URL(path, `${pentagiBase(env)}/`)
   if (query) {
@@ -332,6 +383,20 @@ async function rest(method, path, { query, json, raw, multipart, headers: extraH
       init.body = raw
     }
     const response = await pentagiFetch(url.href, init, env)
+    // flow-files 的 download 对目录/多路径返回 ZIP、对单文件返回 attachment 原始字节，
+    // screenshot 返回 PNG。原先一律走 text()，会把二进制按 UTF-8 解码成乱码再截断，
+    // 字段名还叫 markdown/screenshot，完全对不上。
+    if (binary === true) {
+      const buf = Buffer.from(await response.arrayBuffer())
+      return {
+        ok: response.ok,
+        status: response.status,
+        url: url.href,
+        contentType: response.headers?.get?.('content-type') ?? null,
+        bytes: buf.length,
+        base64: buf.toString('base64'),
+      }
+    }
     const text = await response.text()
     let parsed = null
     try { parsed = JSON.parse(text) } catch { /* not json */ }
@@ -363,6 +428,14 @@ function currentFlowId(args, env = process.env) {
   const raw = String(args.flowId || args.flow_id || flowStore(env).current || '')
   if (!raw || raw.startsWith('local-')) return ''
   return raw
+}
+
+/** 只有纯数字 id 是 PentAGI 后端认的 flow id。本地 ledger 里的 'local-<ts>'
+ *  发给 GraphQL 只会拿到 invalid flow id，而本地却已把状态改掉，
+ *  造成「本地显示已完成 / 远端其实没动」的不一致。 */
+function backendFlowId(raw) {
+  const value = String(raw ?? '').trim()
+  return /^\d+$/.test(value) ? value : ''
 }
 
 async function defaultProviderName(env = process.env) {
@@ -1162,6 +1235,36 @@ function searchBucket(bucket, questions, extraFilter) {
     .map(row => row.item)
 }
 
+// DuckDuckGo 的 html 端点给出的 result__a 链接是协议相对的跳转地址
+// （//duckduckgo.com/l/?uddg=<encoded>）。直接把它交给 fetch 会抛
+// `Failed to parse URL from //duckduckgo.com/...`，所以必须先补 scheme，
+// 再把 uddg 参数解成真实目标地址。
+function normalizeSearchHref(href, baseUrl = 'https://html.duckduckgo.com/') {
+  const raw = String(href ?? '').trim()
+  if (!raw) return ''
+  const absolute = raw.startsWith('//') ? `https:${raw}` : raw
+  try {
+    const u = new URL(absolute, baseUrl)
+    const target = u.searchParams.get('uddg')
+    if (!target) return u.href
+    try {
+      return new URL(target).href
+    } catch {
+      return target
+    }
+  } catch {
+    return absolute
+  }
+}
+
+// httpGet 的兜底：调用点可能传进协议相对地址或 DDG 跳转链接。
+function normalizeHttpTarget(url) {
+  const raw = String(url ?? '').trim()
+  if (!raw) return raw
+  if (raw.startsWith('//') || raw.includes('uddg=')) return normalizeSearchHref(raw)
+  return raw
+}
+
 async function duckduckgo(query, maxResults = 5) {
   const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`
   const page = await httpGet(url)
@@ -1170,7 +1273,9 @@ async function duckduckgo(query, maxResults = 5) {
   const re = /<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi
   let match
   while ((match = re.exec(page.text)) !== null && results.length < maxResults) {
-    results.push({ href: match[1], title: htmlToText(match[2]) })
+    const href = normalizeSearchHref(match[1])
+    if (!href || /^https?:\/\/([a-z0-9-]+\.)*duckduckgo\.com\//i.test(href)) continue
+    results.push({ href, title: htmlToText(match[2]) })
   }
   if (results.length === 0) {
     for (const link of extractLinks(page.text, url)) {
@@ -1287,9 +1392,17 @@ export async function fetchViaScraper(targetUrl, action = 'markdown', env = proc
   parsed.pathname = path
   parsed.search = `url=${encodeURIComponent(targetUrl)}`
   const endpoint = parsed.toString()
+  // /screenshot 返回 PNG 字节；按 UTF-8 解码只会得到乱码。
+  const binary = action === 'screenshot'
   const page = /^https:\/\/(127\.0\.0\.1|localhost)\b/i.test(endpoint)
-    ? await pentagiHttps(endpoint, { method: 'GET', headers })
-    : await httpGet(endpoint, { timeoutMs: 45_000, headers })
+    ? await pentagiHttps(endpoint, { method: 'GET', headers, binary })
+    : await httpGet(endpoint, { timeoutMs: 45_000, headers, binary })
+  if (binary) {
+    const buf = page.binary
+      ? Buffer.from(String(page.base64 ?? ''), 'base64')
+      : Buffer.from(await page.arrayBuffer())
+    return { ok: page.ok, status: page.status, url: targetUrl, scraper: `${parsed.origin}${path}`, bytes: buf.length, base64: buf.toString('base64') }
+  }
   const text = typeof page.text === 'function' ? await page.text() : String(page.text ?? '')
   return { ok: page.ok, status: page.status, url: targetUrl, scraper: `${parsed.origin}${path}`, text }
 }
@@ -1436,10 +1549,16 @@ async function runTerminal(args, env = process.env) {
     const dockerBin = whichDocker('docker', dockerEnv)
     const dockerOk = await spawnCommand(dockerBin, ['--version'], { timeoutMs: 5_000, env: dockerEnv })
     if (!dockerOk.ok) {
+      // fallback:'host' 原先只是文案，全仓没有任何代码消费这个字段 —— 没装
+      // docker 时整个 PentAGI 席位直接不可用（而默认 sandbox 就是开的）。
+      // 现在真正回落，只有用户显式 sandbox:true 才硬失败。
+      if (!sandboxExplicit) {
+        return runTerminalOnHost(args, { input, cwd, timeoutMs, env, reason: 'docker not available for sandbox terminal', detail: dockerOk.stderr?.slice(0, 2_000) })
+      }
       return {
         ok: false,
+        sandbox: true,
         error: 'docker not available for sandbox terminal',
-        fallback: 'host',
         input,
         bin: dockerBin,
         stderr: dockerOk.stderr?.slice(0, 2_000),
@@ -1447,10 +1566,13 @@ async function runTerminal(args, env = process.env) {
     }
     const hasImage = await spawnCommand(dockerBin, ['image', 'inspect', image, '--format', '{{.Id}}'], { timeoutMs: 8_000, env: dockerEnv })
     if (!hasImage.ok) {
+      if (!sandboxExplicit) {
+        return runTerminalOnHost(args, { input, cwd, timeoutMs, env, reason: `sandbox image ${image} is not pulled`, detail: `docker pull ${image}` })
+      }
       return {
         ok: false,
+        sandbox: true,
         error: `sandbox image ${image} is not pulled (source https://github.com/vxcontrol/kali-linux-image)`,
-        fallback: 'host',
         input,
         image,
         bin: dockerBin,
@@ -1507,6 +1629,12 @@ async function runTerminal(args, env = process.env) {
       message: args.message,
     }
   }
+  return runTerminalOnHost(args, { input, cwd, timeoutMs })
+}
+
+/** 在宿主机执行 pg_terminal；同时充当沙箱不可用时的真实回落路径。 */
+async function runTerminalOnHost(args, { input, cwd, timeoutMs, reason, detail }) {
+  const degraded = reason ? { fallback: 'host', sandbox: false, fallbackReason: reason, fallbackDetail: detail } : {}
   if (args.detach === true) {
     const child = spawn(input, {
       cwd,
@@ -1514,8 +1642,20 @@ async function runTerminal(args, env = process.env) {
       detached: true,
       stdio: 'ignore',
     })
+    // spawn 的失败（cwd 不存在、sh 起不来）是异步 'error' 事件；没有监听器时
+    // Node 视其为 uncaughtException，会直接把整个 DSH host 打挂、会话丢失。
+    // 原先这里无监听且乐观返回 ok:true，属可达的崩进程路径。
+    try {
+      await new Promise((res, rej) => {
+        child.once('spawn', res)
+        child.once('error', rej)
+      })
+    } catch (error) {
+      return { ok: false, detached: true, cwd, input, error: String(error?.message ?? error), ...degraded }
+    }
+    child.on('error', () => { /* 二次保险：绝不让它升级为 uncaught */ })
     child.unref()
-    return { ok: true, detached: true, pid: child.pid, cwd, input, message: args.message }
+    return { ok: true, detached: true, pid: child.pid, cwd, input, message: args.message, ...degraded }
   }
   const result = await spawnCommand(input, [], { cwd, timeoutMs, shell: true })
   return {
@@ -1526,6 +1666,7 @@ async function runTerminal(args, env = process.env) {
     stdout: result.stdout.slice(0, 80_000),
     stderr: result.stderr.slice(0, 20_000),
     message: args.message,
+    ...degraded,
   }
 }
 
@@ -1975,15 +2116,30 @@ async function executePentagiTool(name, args = {}, env = process.env) {
       return runTerminal(a, env)
     case 'pg_file': {
       const filePath = resolve(String(a.path ?? ''))
+      // existsSync 对目录同样为真，随后 readFileSync/writeFileSync 会抛 EISDIR。
+      // 这两个分支原先都没有 try/catch，异常会被 host 兜成 toolErrorResult，
+      // 丢掉 {ok:false,error} 结构与路径上下文，模型无法自愈。
+      const isDir = existsSync(filePath) && statSync(filePath).isDirectory()
       if (a.action === 'read_file') {
+        if (isDir) return { ok: false, error: `path is a directory: ${filePath}` }
         if (!existsSync(filePath)) return { ok: false, error: `missing ${filePath}` }
-        const content = readFileSync(filePath, 'utf8')
-        return { ok: true, path: filePath, bytes: content.length, content: content.slice(0, 200_000) }
+        try {
+          const content = readFileSync(filePath, 'utf8')
+          return { ok: true, path: filePath, bytes: content.length, content: content.slice(0, 200_000) }
+        } catch (error) {
+          return { ok: false, path: filePath, error: String(error?.message ?? error) }
+        }
       }
       if (a.action === 'write_file') {
-        mkdirSync(dirname(filePath), { recursive: true })
-        writeFileSync(filePath, String(a.content ?? ''))
-        return { ok: true, path: filePath, bytes: String(a.content ?? '').length, action: 'write_file' }
+        if (isDir) return { ok: false, error: `path is a directory: ${filePath}` }
+        try {
+          const body = String(a.content ?? '')
+          mkdirSync(dirname(filePath), { recursive: true })
+          writeFileSync(filePath, body)
+          return { ok: true, path: filePath, bytes: body.length, action: 'write_file' }
+        } catch (error) {
+          return { ok: false, path: filePath, error: String(error?.message ?? error) }
+        }
       }
       if (a.action === 'edit_file') {
         if (!existsSync(filePath)) return { ok: false, error: `missing ${filePath}` }
@@ -2002,10 +2158,22 @@ async function executePentagiTool(name, args = {}, env = process.env) {
       const target = String(a.url ?? '')
       const action = a.action || 'markdown'
       const scraped = await fetchViaScraper(target, action, env)
-      if (scraped.ok && scraped.text) {
+      if (scraped.ok && (scraped.text || scraped.base64)) {
         if (action === 'html') return { ok: true, engine: 'scraper', status: scraped.status, url: target, html: scraped.text.slice(0, 80_000) }
         if (action === 'links') return { ok: true, engine: 'scraper', status: scraped.status, url: target, links: extractLinks(scraped.text, target), raw: scraped.text.slice(0, 20_000) }
-        if (action === 'screenshot') return { ok: true, engine: 'scraper', status: scraped.status, url: target, screenshot: scraped.text.slice(0, 20_000) }
+        if (action === 'screenshot') {
+          // 原先返回的是 scraped.text —— PNG 字节被 UTF-8 解码后的乱码。
+          const buf = Buffer.from(String(scraped.base64 ?? ''), 'base64')
+          const dir = join(userHome(env), 'pentagi', 'screenshots')
+          try {
+            mkdirSync(dir, { recursive: true })
+            const file = join(dir, `shot-${Date.now()}.png`)
+            writeFileSync(file, buf)
+            return { ok: true, engine: 'scraper', status: scraped.status, url: target, path: file, bytes: buf.length, base64: buf.toString('base64').slice(0, 200_000) }
+          } catch (error) {
+            return { ok: false, engine: 'scraper', status: scraped.status, url: target, bytes: buf.length, error: `写入截图失败：${error?.message ?? error}` }
+          }
+        }
         return { ok: true, engine: 'scraper', status: scraped.status, url: target, markdown: scraped.text.slice(0, 80_000) }
       }
       const page = await httpGet(target)
@@ -2271,24 +2439,38 @@ async function executePentagiTool(name, args = {}, env = process.env) {
     }
     case 'pg_flow_input': {
       const flows = flowStore(env)
-      const flowId = a.flowId || flows.current
+      // 同 pg_flow_stop：绝不能把本地 'local-<ts>' 当后端 flow id 发出去。
+      const flowId = currentFlowId(a, env) || backendFlowId(a.flowId)
       const remote = flowId
         ? await graphql('mutation Put($flowId: ID!, $input: String!) { putUserInput(flowId: $flowId, input: $input) }', { flowId, input: a.input }, env)
-        : { ok: false, error: 'no flowId' }
+        : { ok: false, error: 'no backend flowId' }
+      if (!flowId) {
+        return { ok: false, flowId: null, remote, note: 'local-only flow 没有远端 id，无法投递输入' }
+      }
       flows.notes = [...(flows.notes ?? []), { at: new Date().toISOString(), kind: 'input', input: a.input }].slice(-50)
       saveFlows(flows, env)
       return { ok: true, flowId, remote }
     }
     case 'pg_flow_stop': {
       const flows = flowStore(env)
-      const flowId = a.flowId || flows.current
+      const flowId = currentFlowId(a, env) || backendFlowId(a.flowId)
       const remote = flowId
         ? await graphql('mutation Stop($flowId: ID!) { stopFlow(flowId: $flowId) }', { flowId }, env)
         : { ok: false, error: 'no flowId' }
       const current = (flows.flows ?? []).find(item => item.id === flowId)
-      if (current) current.status = 'stopped'
+      // StatusType 只有 created/running/waiting/finished/failed —— 原先这里写
+      // 'stopped' 是后端并不存在的枚举值，本地状态就此与远端永久脱节。
+      // stopFlow 本身是异步的（标记停止、等 agent 循环自己退出），落定即 finished。
+      if (current) current.status = 'finished'
       saveFlows(flows, env)
-      return { ok: true, flowId, reason: a.reason, remote }
+      return {
+        ok: true,
+        flowId,
+        reason: a.reason,
+        status: 'finished',
+        note: 'stopFlow 是异步的：后端要等当前 agent 循环退出，期间远端状态可能仍显示 running/waiting',
+        remote,
+      }
     }
     case 'pg_flow_finish': {
       const flows = flowStore(env)
@@ -2415,12 +2597,31 @@ async function executePentagiTool(name, args = {}, env = process.env) {
       if (!flowId) return { ok: false, error: 'no flowId' }
       const action = a.action || 'list'
       if (action === 'container') return rest('GET', flowFilesRestPath(flowId, 'container'), { query: a.path ? { path: a.path } : {} }, env)
-      if (action === 'download') return rest('GET', flowFilesRestPath(flowId, 'download'), { query: { path: a.path } }, env)
+      if (action === 'download') {
+        const got = await rest('GET', flowFilesRestPath(flowId, 'download'), { query: { path: a.path }, binary: true }, env)
+        if (!got.ok || !got.base64) return got
+        const buf = Buffer.from(String(got.base64 ?? ''), 'base64')
+        const dir = join(userHome(env), 'pentagi', 'downloads')
+        try {
+          mkdirSync(dir, { recursive: true })
+          const base = String(a.path ?? 'download').split('/').filter(Boolean).pop() || 'download'
+          // 目录/多路径下载回来的是 ZIP（PK 魔数），单文件是原样字节。
+          const isZip = /zip/i.test(String(got.contentType ?? '')) || buf.subarray(0, 2).toString('latin1') === 'PK'
+          const file = join(dir, isZip && !/\.zip$/i.test(base) ? `${base}.zip` : base)
+          writeFileSync(file, buf)
+          return { ok: true, status: got.status, flowId, source: a.path, path: file, bytes: buf.length, contentType: got.contentType, archive: isZip }
+        } catch (error) {
+          return { ok: false, status: got.status, flowId, source: a.path, bytes: buf.length, error: `写入本地文件失败：${error?.message ?? error}` }
+        }
+      }
       if (action === 'upload') {
         const localPath = String(a.path || '').trim()
         let filename = String(a.filename || '').trim()
         let body
-        if (localPath && existsSync(localPath) && !localPath.startsWith('/work')) {
+        // 前缀匹配会把 /workdir/x 这类宿主路径误判成容器路径，
+        // 容器路径应当是 /work 本身或以 /work/ 开头。
+        const looksContainerPath = /^\/work(\/|$)/.test(localPath)
+        if (localPath && existsSync(localPath) && !looksContainerPath) {
           body = readFileSync(localPath)
           if (!filename) filename = localPath.split('/').pop()
         } else if (a.content !== undefined) {
